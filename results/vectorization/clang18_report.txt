@@ -1,0 +1,12 @@
+src/kernels_branchless.inl:17:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-ve
+src/kernels_branchless.inl:64:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-ve
+src/kernels_branchless.inl:121:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-v
+src/kernels_omp_simd.cpp:48:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-vect
+src/kernels_omp_simd.cpp:99:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-vect
+src/kernels_omp_simd.cpp:158:13: remark: vectorized loop (vectorization width: 8, interleaved count: 1) [-Rpass=loop-vec
+src/kernels_scalar.cpp:19:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]
+src/kernels_scalar.cpp:27:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]
+src/kernels_scalar.cpp:35:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]
+src/kernels_branchless.inl:17:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]
+src/kernels_branchless.inl:64:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]
+src/kernels_branchless.inl:121:13: remark: loop not vectorized [-Rpass-missed=loop-vectorize]

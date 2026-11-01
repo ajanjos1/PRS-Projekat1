@@ -1,0 +1,28 @@
+Benchmark: reps=10, warmup=2, spin-up=200 koraka, dt=0.05 s
+compiler=GNU 13.3.0; build_type=Release; cxx_flags= -O3 -DNDEBUG -ffp-contract=off -fno-math-errno OpenMP=-fopenmp (OpenMP 4.5); scalar_flags=-fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize; vector_flags=-mavx2 -fno-trapping-math; openmp=201511 (max_threads=2); avx2_build=on
+
+=== Mreza 1000x1000 (8 koraka po mjerenju) ===
+  A_scalar             p=1  med   214.172 ms  min   207.072  max   258.475  sd  16.171    37.353 Mcel/s  S=1.00  [bit-identicno]
+  B_auto               p=1  med    34.163 ms  min    32.078  max    42.061  sd   2.815   234.171 Mcel/s  S=6.27  [bit-identicno]
+  C_omp_simd           p=1  med    33.986 ms  min    29.526  max    38.600  sd   2.301   235.390 Mcel/s  S=6.30  [bit-identicno]
+  D_avx2               p=1  med    30.818 ms  min    30.183  max    33.878  sd   1.126   259.592 Mcel/s  S=6.95  [bit-identicno]
+  E_omp                p=1  med   215.367 ms  min   195.737  max   246.339  sd  17.435    37.146 Mcel/s  S=0.99  [bit-identicno]
+  E_omp                p=2  med   105.347 ms  min    99.318  max   132.728  sd   9.371    75.939 Mcel/s  S=2.03  [bit-identicno]
+  F_omp_simd           p=1  med    33.738 ms  min    27.015  max    35.754  sd   2.564   237.119 Mcel/s  S=6.35  [bit-identicno]
+  F_omp_simd           p=2  med    18.575 ms  min    16.785  max    24.534  sd   2.172   430.692 Mcel/s  S=11.53  [bit-identicno]
+  G_omp_avx2           p=1  med    30.267 ms  min    29.609  max    35.550  sd   1.734   264.316 Mcel/s  S=7.08  [bit-identicno]
+  G_omp_avx2           p=2  med    16.785 ms  min    16.025  max    17.094  sd   0.405   476.623 Mcel/s  S=12.76  [bit-identicno]
+
+=== Mreza 250x250 (134 koraka po mjerenju) ===
+  A_scalar             p=1  med   278.720 ms  min   270.798  max   293.112  sd   7.182    30.048 Mcel/s  S=1.00  [bit-identicno]
+  B_auto               p=1  med    37.526 ms  min    33.695  max    45.218  sd   3.680   223.181 Mcel/s  S=7.43  [bit-identicno]
+  C_omp_simd           p=1  med    33.799 ms  min    33.559  max    35.776  sd   0.777   247.792 Mcel/s  S=8.25  [bit-identicno]
+  D_avx2               p=1  med    32.172 ms  min    30.229  max    36.337  sd   1.648   260.318 Mcel/s  S=8.66  [bit-identicno]
+  E_omp                p=1  med   266.258 ms  min   232.375  max   286.235  sd  13.650    31.454 Mcel/s  S=1.05  [bit-identicno]
+  E_omp                p=2  med   137.719 ms  min   107.748  max   158.575  sd  15.828    60.812 Mcel/s  S=2.02  [bit-identicno]
+  F_omp_simd           p=1  med    25.722 ms  min    25.214  max    35.738  sd   4.751   325.598 Mcel/s  S=10.84  [bit-identicno]
+  F_omp_simd           p=2  med    20.373 ms  min    17.683  max    30.378  sd   4.832   411.078 Mcel/s  S=13.68  [bit-identicno]
+  G_omp_avx2           p=1  med    32.982 ms  min    23.631  max    47.098  sd   6.354   253.925 Mcel/s  S=8.45  [bit-identicno]
+  G_omp_avx2           p=2  med    17.418 ms  min    16.927  max    18.666  sd   0.563   480.818 Mcel/s  S=16.00  [bit-identicno]
+
+Rezultati: results/benchmarks_non_multiple8.csv i results/benchmark_runs_non_multiple8.csv

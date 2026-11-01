@@ -1,0 +1,6 @@
+objekat ymm packed scalar_ss vsqrtps vdivps
+kernels_scalar 0 0 104 0 0
+kernels_scalar_branchless 0 0 199 0 0
+kernels_auto 184 202 292 4 8
+kernels_omp_simd 185 101 102 2 4
+kernels_avx2 198 137 142 2 4

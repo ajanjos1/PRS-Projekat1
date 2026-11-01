@@ -1,0 +1,15 @@
+W=512
+H=512
+steps=6000
+dt=0.05
+cell_size=1
+variant=G_omp_avx2
+threads=2
+wall_time_s=3.31833
+rain_rate=0.002
+evaporation=0.01
+Kc=0.6
+Ks=0.6
+Kd=0.6
+min_tilt=0.05
+erosion_depth=0.1

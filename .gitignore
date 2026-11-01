@@ -1,0 +1,15 @@
+build/
+build-*/
+demo_out/
+__pycache__/
+*.o
+
+# Visual Studio (kesevi koje VS drzi zakljucane; "Stage All" bez ovoga pada)
+.vs/
+out/
+
+# Generisani artefakti (nastaju iz koda i skripti, ne verzionisu se)
+*.docx
+results/figures/*.png
+results/sim512/*.npy
+results/.bench_done
