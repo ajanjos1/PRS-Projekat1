@@ -1,831 +1,551 @@
-# PRS – Shallow-water and Terrain Erosion (CPU faza)
+# PRS – Shallow-water and Terrain Erosion
 
-Seminarski rad iz predmeta **Paralelni računarski sistemi** (ETF Sarajevo).
+Seminarski projekat iz predmeta **Paralelni računarski sistemi** (ETF Sarajevo).
 
-Konzolna C++20 aplikacija `prs_swe` simulira tok vode po terenu (model virtuelnih cijevi, Mei, Decaudin, Hu 2007)
-zajedno s hidrauličkom erozijom, depozicijom i konzervativnim transportom sedimenta. **Isti algoritam** je
-implementiran u više CPU varijanti – skalarna referenca, automatska vektorizacija, `#pragma omp simd`, ručni AVX2
-intrinsics i njihove kombinacije s OpenMP dretvama – a program ih **mjeri, poredi i provjerava da svaka daje
-bit-identičan rezultat skalarnoj referenci**.
+`prs_erosion` je **konzolni simulator hidrauličke erozije terena** zasnovan na **metodi virtuelnih cijevi**
+(Virtual Pipes / hydrostatic pipe model; Mei, Decaudin, Hu 2007; Šťava i dr. 2008). Teren se **odabere na karti
+svijeta** (stvarne visine i razmjera se preuzimaju automatski) ili učita iz height mape (PNG ili JPEG). Korisnik
+zatim unese ukupnu količinu kiše u L/m² i trajanje u satima, a program numerički simulira tok vode, eroziju,
+transport i taloženje sedimenta i zapiše **erodiranu height mapu** – istih dimenzija i u istoj visinskoj skali, sa
+stvarno promijenjenim visinama terena.
 
-Ovaj dokument objašnjava projekat „odozdo": kako su podaci složeni u memoriji, šta tačno računa svaka petlja,
-kako kompajler i procesor izvršavaju kernele, kako se projekat gradi i pokreće i kako se čitaju izlazni fajlovi.
+Ovo je **faza 2: serijska implementacija** (bez OpenMP-a, SIMD intrinsics, dretvi i GPU-a). Ranija implementacija
+(faza 1, CPU benchmark SIMD/OpenMP varijanti `prs_swe`) je zamijenjena ovom – vidi [odjeljak 13](#13-razlike-u-odnosu-na-fazu-1).
+
+Detaljno objašnjenje modela za odbranu: **[docs/ALGORITHM_EXPLANATION.md](docs/ALGORITHM_EXPLANATION.md)**.
 
 ## Sadržaj
 
-1. [Brzi start](#1-brzi-start)
-2. [Model: šta se računa](#2-model-šta-se-računa)
-3. [Raspored podataka u memoriji](#3-raspored-podataka-u-memoriji)
-4. [Kako teče jedan korak](#4-kako-teče-jedan-korak)
-5. [Varijante i kerneli na niskom nivou](#5-varijante-i-kerneli-na-niskom-nivou)
-6. [Zašto su rezultati bit-identični](#6-zašto-su-rezultati-bit-identični)
-7. [Build sistem](#7-build-sistem)
-8. [Pokretanje u detalje](#8-pokretanje-u-detalje)
-9. [Izlazni fajlovi](#9-izlazni-fajlovi)
-10. [Metodologija mjerenja](#10-metodologija-mjerenja)
-11. [Testovi](#11-testovi)
-12. [Rezultati](#12-rezultati)
-13. [Struktura repozitorija](#13-struktura-repozitorija)
-14. [Poznate napomene i ograničenja](#14-poznate-napomene-i-ograničenja)
-15. [Literatura](#15-literatura)
+1. [Šta aplikacija radi](#1-šta-aplikacija-radi)
+2. [Brzi start](#2-brzi-start)
+3. [Pokretanje simulacije](#3-pokretanje-simulacije)
+4. [Kako se učitava height mapa](#4-kako-se-učitava-height-mapa)
+5. [Kako se interpretiraju padavine](#5-kako-se-interpretiraju-padavine)
+6. [Kako funkcioniše metoda virtuelnih cijevi](#6-kako-funkcioniše-metoda-virtuelnih-cijevi)
+7. [Kako nastaju erozija i depozicija](#7-kako-nastaju-erozija-i-depozicija)
+8. [Kako se izvozi erodirana mapa](#8-kako-se-izvozi-erodirana-mapa)
+9. [Kompajliranje](#9-kompajliranje)
+10. [Testovi](#10-testovi)
+11. [Izmjereni rezultati](#11-izmjereni-rezultati)
+12. [Ograničenja numeričkog modela](#12-ograničenja-numeričkog-modela)
+13. [Razlike u odnosu na fazu 1](#13-razlike-u-odnosu-na-fazu-1)
+14. [Struktura projekta](#14-struktura-projekta)
+15. [Literatura, reference i licence](#15-literatura-reference-i-licence)
 
 ---
 
-## 1. Brzi start
+## 1. Šta aplikacija radi
 
-Zahtjevi: **CMake ≥ 3.16**, **C++20 kompajler** (GCC ≥ 10, Clang ≥ 12 ili MSVC 2022/2026), procesor s **AVX2** (za
-varijante D i G), OpenMP (opciono). Python 3 s `numpy` i `matplotlib` samo za grafikone.
-
-### Windows (jedna komanda)
-
-```bat
-scripts\demo.cmd
+```
+teren s karte (birač u pregledniku) ──┐  PNG + .terrain.json (stvarna razmjera i visine u metrima)
+  ili height mapa iz fajla (PNG/JPEG) ┤
+kiša: L/m² i sati ────────────────────┼─► voda teče kroz virtuelne cijevi ─► erozija ─► transport ─► depozicija
+skala: m/piksel, min/max (ako nije ───┘          (adaptivni korak Δt, fizičko vrijeme: npr. 5 h = 18000 s)
+       došla s karte)                                              │
+                                                                   ▼
+      erodirana height mapa (16-bitni PNG, ista skala) + mapa razlike + poređenje + dubina vode + izvještaj
 ```
 
-Skripta izgradi projekat (Release), ispiše podatke o CPU-u, pokrene testove, benchmark, STREAM test memorije i
-simulaciju 512×512, pa napravi grafikone. Traje oko 2–3 minute, a sav izlaz ide u `demo_out\`
-(folder `results\` se ne dira). Detalji i opcije: [odjeljak 8.2](#82-windows--demo-skripta).
+- **Ulaz:** teren odabran na karti (meni **[1]**) ili height mapa `.png` / `.jpg` / `.jpeg` (crno = najniže,
+  bijelo = najviše), ukupna kiša [L/m²], trajanje kiše [h], opcioni period oticanja bez kiše [h]. Fizička skala
+  (veličina ćelije, min/max visina) dolazi s karte ili je zadaje korisnik.
+- **Izlaz:** `<ime>_eroded.png` – ista height mapa nakon erozije (16 bita, iste dimenzije i orijentacija, ista
+  visinska skala kao ulaz), plus vizualizacije, sirovi podaci i izvještaj s bilansima vode i materijala.
+- Promjene visine nastaju **isključivo iz modela** (voda → protok → erozija → transport → depozicija), a ne iz
+  filtera slike.
+
+## 2. Brzi start
+
+Zahtjevi: **CMake ≥ 3.16** i **C++20 kompajler** (MSVC iz Visual Studio 2022/2026, GCC ≥ 11 ili Clang ≥ 14).
+Nema vanjskih zavisnosti – biblioteka za slike (stb) je u `third_party/`. Python je potreban samo za opcione
+skripte (`scripts/`).
+
+### Windows (Visual Studio)
+
+**Najkraće:** u PowerShellu u folderu projekta ukucaj `.\Pokreni` (pa u meniju **[1]** odaberi teren na karti). Skripta sama izgradi samo izmijenjene fajlove
+(prvi put i konfiguriše CMake) i pokrene program. `.\Pokreni test` pokreće testove, a argumenti se prosljeđuju
+programu (`.\Pokreni --input teren.png --rain 100 --hours 3`).
+
+Da bude dovoljno samo `Pokreni` (bez `.\`, iz bilo kojeg foldera), jednom pokreni `scripts\instaliraj_pokreni.cmd`:
+dodaje folder projekta u korisnički PATH (bez administratora; poništava se sa `scripts\ukloni_pokreni.cmd`), pa
+otvori novi terminal.
+
+Demo (build → testovi → simulacija na priloženom primjeru → slike):
+
+```bat
+scripts\erosion_demo.cmd
+```
+
+Ili ručno, iz korijena projekta (**Developer PowerShell** ili obični terminal sa CMake-om u `PATH`):
+
+```bat
+cmake -S . -B build-vs -G "Visual Studio 17 2022" -A x64
+cmake --build build-vs --config Release
+build-vs\Release\prs_erosion_tests.exe
+build-vs\Release\prs_erosion.exe
+```
+
+(Za Visual Studio 2026 generator je `"Visual Studio 18 2026"`; postojeći `build-vs` folder se samo ponovo
+izgradi drugom komandom.)
 
 ### Linux / macOS
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/prs_tests                  # 335 testova, očekuje se "0 neuspjesnih"
-./build/prs_swe info               # CPU, AVX2, OpenMP, lista varijanti
-./build/prs_swe bench --sizes 512 --threads 1,2 --reps 5
+./build/prs_erosion_tests        # 44 testa, očekuje se "neuspjelih provjera: 0"
+./build/prs_erosion              # interaktivni meni
 ```
 
----
+## 3. Pokretanje simulacije
 
-## 2. Model: šta se računa
+Program se pokreće **iz korijena projekta** (rezultati idu u `output/<ime_mape>/`). Teren se može dobiti na tri
+načina:
 
-Domena je pravougaona mreža **W × H** ćelija veličine `L × L` metara. U svakoj ćeliji se pamte (sve `float`):
-
-| Oznaka | Značenje | Jedinica |
+| Način | Kako | Skala terena |
 |---|---|---|
-| `b` | visina terena | m |
-| `d` | dubina vode | m |
-| `s` | suspendovani sediment (izražen kao visina) | m |
-| `sr` | pomoćno polje: sediment po jedinici izlaznog volumena, `s·dt / (d1·L²)` | – |
-| `fL, fR, fT, fB` | izlazni protok vode kroz lijevu, desnu, gornju (`y−1`) i donju (`y+1`) virtuelnu cijev | m³ po koraku |
+| **[1] Karta** (preporučeno) | program otvori birač u pregledniku, teren stiže automatski | automatski (`.terrain.json`) |
+| **[2] Fajl** | putanja do PNG/JPEG height mape | iz `.terrain.json` pored slike, inače se unosi |
+| **Komandna linija** | `--input … --rain … --hours …` | iz `.terrain.json` ili `--cell/--min/--max` |
 
-Voda se između susjednih ćelija prenosi „cijevima" presjeka `A`; protok kroz cijev proporcionalan je razlici
-ukupnih visina vode `h = b + d`. Jedan **vremenski korak** ima tri faze. U formulama ispod `i` je ćelija, a indeksi
-`l, r, t, bt` označavaju lijevog, desnog, gornjeg i donjeg susjeda. Referentna implementacija jedne ćelije je u
-[`include/cell_ops.hpp`](include/cell_ops.hpp) (`flux_cell`, `water_cell`, `sediment_cell`).
+### Odabir terena na karti (birač terena)
 
-### Faza 1 – kiša i izlazni protoci
+Umjesto da veličinu ćelije i visine unosiš napamet, teren možeš odabrati na karti. U meniju odaberi **[1] Odaberi teren
+na karti**:
 
-```
-d1   = d + r·dt                                    kiša (d se ovdje NE upisuje)
-h    = b + d1;    h_nb = b_nb + (d_nb + r·dt)      visine ćelije i susjeda
-n_k  = max(0, f_k + (dt·A·g / L) · (h − h_k))      za k ∈ {L, R, T, B}
-n_k  = n_k · open_k                                zid: open = 0 na rubu, inače 1
-out  = (((nL + nR) + nT) + nB) · dt
-K    = min(1, d1·L² / max(out, 1e-30))             ne izbaci više vode nego što je ima
-f_k  = n_k · K
-```
+1. Program pokrene mali **lokalni server** (samo `127.0.0.1`, nije dostupan s mreže) i otvori birač u pregledniku na
+   adresi `http://127.0.0.1:<port>/?token=<nasumični token>`. Na vrhu stranice piše „Povezano s programom“.
+2. Pronađi mjesto (pretraga ili pomjeranje karte) i **nacrtaj pravougaonik** ili uzmi „Koristi trenutni pogled“.
+3. Izaberi najveću dimenziju slike (zadano 512 px) i klikni **Generiši teren**. Stranica preuzme visinske pločice,
+   napravi 16-bitni PNG i metapodatke i **sama ih pošalje programu** – ništa se ne preuzima ručno.
+4. Program ih spremi u `tereni/<ime>.png` i `tereni/<ime>.terrain.json`, učita, ispiše metapodatke (veličina ćelije,
+   najniža i najviša visina u metrima, koordinate) i pita samo `Koristiti ove vrijednosti terena? [D/n]`. Ostaje kiša.
 
-Zidovi na rubu domene ostvareni su **množenjem maskom 0/1**, a ne grananjem: `openL[x]` i `openR[x]` su nizovi po
-koloni (0 za `x = 0`, odnosno `x = W−1`), a `open_t` / `open_b` su skalari po redu (`y > 0`, `y < H−1`).
+Dok program čeka preglednik, **Enter** prekida čekanje; tada se koristi rezervni način: preuzmi oba fajla
+(„Preuzmi oba fajla“), vrati se u program i pritisni Enter – program nađe najnoviji izvoz u folderu Preuzimanja.
+Isti rezervni način se koristi ako se lokalni server ne može pokrenuti. Upload bez ispravnog tokena ili s tuđim
+`Host` zaglavljem server odbija, a ime fajla iz preglednika se čisti (nema izlaska iz foldera `tereni/`).
 
-### Faza 2 – voda, brzina, erozija/depozicija, isparavanje
+Isto vrijedi za opciju **[2]** i za komandnu liniju: ako pored slike postoji `<ime>.terrain.json`, skala se učita iz
+njega (`--terrain-json FAJL` navodi drugi fajl; zadane opcije `--cell/--min/--max` imaju prednost). Ako je slika
+kasnije **smanjena** (isti omjer stranica), veličina ćelije se sama preračuna; za promijenjen omjer stranica program
+odbija metapodatke i traži ručni unos.
 
-```
-fin   = ((fR[l] + fL[r]) + fB[t]) + fT[bt]         ono što susjedi šalju PREMA ovoj ćeliji
-fout  = ((fL + fR) + fT) + fB
-d2    = max(0, d1 + (fin − fout)·dt / L²)
-dmean = ½·(d1 + d2)
-wx    = ½·((in_l − fL) + (fR − in_r))              neto protok po x
-wy    = ½·((in_t − fT) + (fB − in_b))              neto protok po y
-inv   = (dmean > min_depth) ? 1/(L·dmean) : 0
-speed = sqrt((wx·inv)² + (wy·inv)²)
+Kako radi i šta treba znati:
+- **Podaci:** AWS Terrain Tiles (Mapzen), Terrarium pločice – javne, bez ključa. Visina je kodirana u boji piksela,
+  `(R·256 + G + B/256) − 32768` m. Stranica ih čita direktno iz preglednika (bez vanjskog servera, ključa ili instalacije); lokalni server programa
+  samo servira stranicu i prima rezultat.
+- **Razmjera:** kvadratni pikseli u Web Mercatoru; veličina ćelije = metri po pikselu · cos(geografska širina centra).
+- **Stvarna rezolucija podataka** je u većem dijelu svijeta (uključujući BiH) oko **30 m** (SRTM / EU-DEM), pa ćelije
+  manje od toga samo interpoliraju i simulacija traje duže bez dodatnih detalja. Stranica na to upozorava.
+- **Površinski model:** visine mogu uključivati krošnje/zgrade (SRTM), ne samo golo tlo.
+- **Smanjenje slike** u editoru blago ublaži vrhove, pa najviša tačka u smanjenoj slici može biti malo niža od
+  vrijednosti u JSON-u. Najbolje je odmah izvesti željenu dimenziju (npr. 512 px).
+- **Treba internet** (karta, pločice). Pretraga mjesta koristi Nominatim. Atribucija se prikazuje na stranici i upisuje u
+  JSON: „SRTM data courtesy of the U.S. Geological Survey“, „Produced using Copernicus data and information funded by
+  the European Union - EU-DEM layers“, Mapzen/AWS Terrain Tiles, © OpenStreetMap contributors.
+- Ako program ne može sam otvoriti preglednik, ispiše adresu `http://127.0.0.1:…`; otvori je ručno. Stranica radi i
+  otvorena dvoklikom kao fajl – tada se fajlovi preuzimaju ručno (opcija [2]).
 
-gx, gy = (b[x+1] − b[x−1]) / 2L ,  (b[y+1] − b[y−1]) / 2L        centralne razlike nagiba terena
-sinα   = max( sqrt(g² / (1 + g²)), min_tilt ),   g² = gx² + gy²
-C      = ((K_c · sinα) · speed) · min(1, dmean / erosion_depth)  kapacitet transporta
+### Iz fajla (interaktivno)
 
-diff   = C − s
-amount = (diff > 0 ? dt·K_s : dt·K_d) · diff       erozija (>0) ili depozicija (≤ 0)
-b_dst  = b_src − amount                            teren se mijenja (u DRUGI bafer)
-s1     = s + amount
-sr     = (d1 > sediment_eps) ? (s1·dt) / (d1·L²) : 0
-d      = d2 · (1 − K_e·dt)                         isparavanje; ovdje se d prvi put upisuje
-```
-
-### Faza 3 – transport sedimenta
-
-Konzervativni **upwind** prenos kroz iste cijevi: ćelija šalje udio sedimenta jednak udjelu vode koji je napustila, a
-prima isto ono što su susjedi poslali prema njoj.
+Sva pitanja i poruke su na bosanskom. Prazan unos (Enter) uzima zadanu vrijednost u uglastoj zagradi.
 
 ```
-fout = ((fL + fR) + fT) + fB
-in   = ((sr[l]·fR[l] + sr[r]·fL[r]) + sr[t]·fB[t]) + sr[bt]·fT[bt]
-s    = max(0, (s − sr·fout) + in)
+================================================
+      SHALLOW-WATER AND TERRAIN EROSION
+                  PRS PROJECT
+================================================
+
+[1] Odaberi teren na karti (otvara preglednik)
+[2] Učitaj heightmapu iz fajla
+[3] Izlaz
+
+Odaberite opciju:
+> 2
+
+Unesite putanju do heightmape (.png, .jpg, .jpeg; prazno = povratak na meni):
+> assets/heightmaps/primjer_1/height-map-input-try-1-height-map-16bit-texturemap-app-2026-11-08.png
+
+Heightmapa je uspješno učitana!
+
+Rezolucija: 412 x 221 (nije kvadratna)
+Format: PNG
+Broj kanala: 1
+Dubina boje: 16 bita po kanalu
+
+----------------------------------------
+KONFIGURACIJA TERENA
+----------------------------------------
+Veličina ćelije u metrima (širina terena u metrima / broj piksela) [zadano: 30]:
+> (Enter)
+Minimalna visina u metrima (crni piksel) [zadano: 0]:
+> (Enter)
+Maksimalna visina u metrima (bijeli piksel) [zadano: 100]:
+> (Enter)
+Invertovati heightmapu (bijelo = najniže)? [d/N]:
+> (Enter)
+
+----------------------------------------
+KONFIGURACIJA KIŠE
+----------------------------------------
+Ukupna količina kiše (L/m2 = mm):
+> 100
+Trajanje kiše (sati):
+> 5
+Prosječni intenzitet: 20 mm/h
+Period oticanja nakon kiše, bez padavina (sati) [zadano: 0]:
+> (Enter)
+Rubni uslov (zatvoren = zidovi, otvoren = voda može napustiti mapu) [zatvoren/otvoren, zadano: zatvoren]:
+> (Enter)
+
+... SAŽETAK SIMULACIJE ...
+Pokrenuti simulaciju? [D/N]:
+> d
+
+Pokrećem simulaciju (napredak se osvježava svakih nekoliko sekundi; prekid: Ctrl+C)...
+
+Napredak:   5.0% | t = 0.25 / 5.00 h (kiša)    | koraka 342 | dt 2.227 s | proteklo 1.4 s | preostalo ~27.3 s
+...
+Napredak: 100.0% | t = 5.00 / 5.00 h (gotovo)  | koraka 10546 | dt 0.252 s | proteklo 44.2 s | preostalo ~0.0 s
+
+----------------------------------------
+REZULTATI
+----------------------------------------
+Simulirano vrijeme: 5 h (5 h kiše + 0 h oticanja)
+Vrijeme izvršavanja: 44.23 s (10546 vremenskih koraka, dt 1.3 .. 10 s)
+Ukupno erodirani materijal: 161937.37 m3 (zbir svih događaja erozije)
+Ukupno istaloženi materijal: 161937.37 m3 (uključujući 3823.65 m3 istaloženo na kraju)
+Neto promjena terena: 155285.78 m3 snižen, 155285.78 m3 podignut
+Najveća promjena visine: -0.4721 m (erozija) / +0.6399 m (taloženje)
+Greška bilansa vode: 1.96e-08 m3 (relativno 2.39e-15)
+Greška bilansa materijala: 1.07e-07 m3 (relativno 6.60e-13)
+Rezultat je uspješno sačuvan.
 ```
 
-Zbir `teren + sediment` se čuva (do greške zaokruživanja), a voda se čuva do na kišu i isparavanje – to provjeravaju
-testovi ([odjeljak 11](#11-testovi)).
+Između pragova od 5 % program svake ~3 s osvježava isti red (znak `\r`), pa se odmah vidi da radi i kolika je procjena
+preostalog vremena, čak i kad jedan prag traje minutama (velike mape, sitne ćelije).
 
-### Parametri (`SimParams` u `include/simulation.hpp`)
+(Skraćen stvarni ispis programa; Linux VM, vidi [odjeljak 11](#11-izmjereni-rezultati).) Neispravan unos
+(tekst, negativna kiša, trajanje 0, NaN…) ne ruši program – ispisuje se razlog i pitanje se ponavlja; prazan unos
+uzima podrazumijevanu vrijednost; decimalni zarez i tačka su dozvoljeni.
 
-| Parametar | Zadano | Značenje |
-|---|---|---|
-| `cell_size` (L) | 1,0 m | veličina ćelije |
-| `pipe_area` (A) | 1,0 m² | presjek virtuelne cijevi |
-| `gravity` (g) | 9,81 m/s² | gravitacija |
-| `dt` | 0,05 s | traženi vremenski korak |
-| `cfl` | 0,9 | faktor sigurnosti u CFL uslovu |
-| `rain_rate` (r) | 0,002 m/s | kiša, uniformno po domeni |
-| `evaporation` (K_e) | 0,01 1/s | isparavanje |
-| `capacity` (K_c) | 0,6 | konstanta kapaciteta transporta |
-| `dissolve` (K_s) | 0,6 1/s | brzina erozije |
-| `deposit` (K_d) | 0,6 1/s | brzina depozicije |
-| `min_tilt` | 0,05 | donja granica za `sin α` (erozija i na ravnom) |
-| `min_depth` | 1e-3 m | ispod ove srednje dubine brzina je 0 |
-| `erosion_depth` | 0,1 m | do ove dubine kapacitet linearno raste |
-| `sediment_eps` | 1e-6 m | ćelije plitke od ovoga ne šalju sediment |
-
-### Izvedene konstante i CFL uslov (`StepConstants`)
-
-`make_step_constants()` jednom unaprijed računa sve što ne zavisi od ćelije (`rain_dt = r·dt`, `flux_coef = dt·A·g/L`,
-`cell_area = L²`, `dt_over_area`, `inv_2L`, `dt_ks`, `dt_kd`, `inv_erosion_depth`, `evap_factor = 1 − K_e·dt`, …) i tako
-**svi kerneli koriste iste float konstante** (preduslov za bit-identičnost).
-
-Eksplicitna šema je stabilna samo za `c·dt/L ≤ 1/√2`, gdje je `c = √(g·A/L)` brzina talasa u modelu cijevi. Zato se
-koristi `dt = min(traženi, cfl·L / (√2·c))`. Za zadane parametre: `c = 3,132 m/s`, CFL limit `= 0,2032 s`, pa se koristi
-traženih `0,05 s`. Dodatno se baca izuzetak ako `dt·K_s > 1`, `dt·K_d > 1` ili `1 − K_e·dt < 0` (relaksacija bi
-„preskočila" ravnotežu).
-
-### Početni teren (`src/terrain.cpp`)
-
-Deterministički fBm „value noise" (6 oktava, seed `20251`) plus centralni masiv i „grebeni":
-`h = 0,45·massif² + 0,35·n + 0,20·ridge·massif`, skalirano na visinu `0,12·W·L`. Računa se u `double` i zavisi samo od
-normalizovanih koordinata `(u, v) ∈ [0,1]`, pa sve rezolucije (128…1024) prikazuju isti pejzaž, a sve varijante dobijaju
-identične ulaze. Voda, sediment i protoci počinju od nule.
-
----
-
-## 3. Raspored podataka u memoriji
-
-### SoA, `float`, row-major
-
-Svaka veličina je poseban niz (**Structure of Arrays**). Razlog: SIMD instrukcija učitava 8 uzastopnih `float`
-vrijednosti **istog polja**; da je raspored AoS (struktura po ćeliji), ta polja bi bila razbacana po memoriji.
-`Simulation` (`include/simulation.hpp`) posjeduje 9 punih nizova (`b[0]`, `b[1]`, `d`, `s`, `sr`, `fL`, `fR`, `fT`, `fB`)
-i 2 mala niza maski (`openL`, `openR`). `Fields` je **nevlasnički pogled** (sirovi pokazivači + `pitch`, `width`,
-`height`) koji se predaje kernelima.
-
-### Halo i padding
-
-```
-              kolona:  0 ........ 7 | 8 ......... 8+W-1 | 8+W ... pitch-1
-  red 0   (gornji halo)                 [ halo: kopija reda y=0  ]
-  red 1   (y = 0)        [ pad (7 praznih) | L-halo ] [ ćelije x = 0 … W-1 ] [ D-halo | pad ]
-  red 2   (y = 1)        ...
-  ...
-  red H   (y = H-1)
-  red H+1 (donji halo)                  [ halo: kopija reda y=H-1 ]
-```
-
-- Unutrašnja ćelija `(x, y)` je na indeksu **`i = (y + 1)·pitch + kPadLeft + x`**, `kPadLeft = 8`
-  (`Simulation::index`, `Fields::row_offset`).
-- Okvir širine 1 ćelija (halo) znači da stencil `i±1`, `i±pitch` **nikad ne izlazi iz niza** i da na rubu nema posebnih
-  slučajeva u petlji.
-- `pitch = round_up(kPadLeft + W + 1, 8)` – tj. 8 ćelija lijevo, `W` ćelija, najmanje 1 halo ćelija desno, zaokruženo
-  na višekratnik od 8. Broj redova je `H + 2`.
-- Halo se puni samo za **teren** (`refresh_halo`: replikacija rubnih vrijednosti, Neumann uslov), jer je potreban za
-  nagib na rubu. Halo ostalih polja ostaje 0 i testovi provjeravaju da ga niko ne upisuje.
-
-Primjer `W = H = 512`: `pitch = round_up(8 + 512 + 1, 8) = 528`, redova 514, jedan niz ima 271 392 `float` ≈ 1,04 MiB,
-a svih 9 punih nizova ≈ 9,3 MiB (otprilike veličina L3 keša običnog desktop procesora).
-
-### Poravnanje
-
-- `AlignedBuffer` alocira memoriju **poravnatu na 64 B** (`std::aligned_alloc` / `_aligned_malloc`) i popunjava je
-  nulama (uključujući halo i padding).
-- Početak unutrašnjeg reda je `(y+1)·pitch + 8` elemenata. Pošto je `pitch` višekratnik od 8, a 8 `float` = 32 B,
-  **svaki red počinje na 32-bajtnoj granici**. Zato AVX2 kernel koristi poravnato učitavanje (`_mm256_load_ps`) za
-  centralnu ćeliju i susjede gore/dolje (`x ± pitch` ostaje višekratnik od 8), a **neporavnato**
-  (`_mm256_loadu_ps`) samo za lijevog i desnog susjeda (`x − 1`, `x + 1`).
-
-### Dvostruko baferovan teren
-
-Faza 2 čita visine terena susjeda (za nagib) **i** mijenja teren ćelije. Kad bi se pisalo u isti niz, ćelija bi čitala
-već izmijenjenu visinu susjeda iz istog koraka, a rezultat bi zavisio od redoslijeda (i dretvi). Zato postoje dva
-bafera: `b_src` se samo čita, `b_dst` se samo piše, a na kraju koraka `swap_terrain()` zamijeni uloge (zamjena indeksa,
-bez kopiranja).
-
-### Saobraćaj prema memoriji
-
-`bench` koristi minimalni model od **112 B po ćeliji i koraku** (faza 1: 6 čitanja + 4 upisa, faza 2: 7 + 4, faza 3:
-6 + 1 → 28 `float` · 4 B, pod pretpostavkom da se susjedi uzimaju iz keša). Kolona `est_GBps` je zato **gornja procjena
-prometa**, a ne mjerenje DRAM-a.
-
----
-
-## 4. Kako teče jedan korak
-
-### Lanac poziva
-
-```
-main()                                        src/main.cpp
- └─ run_bench / run_simulate / run_stream / print_info
-     └─ run_steps(sim, c, steps, kernels, driver, threads)       src/variants.cpp
-         ├─ Driver::Serial         → run_serial(...)             src/driver_serial.cpp
-         ├─ Driver::OmpParallelFor → run_omp_parallel_for(...)   src/driver_openmp.cpp
-         └─ Driver::OmpRegion      → run_omp_region(...)         src/driver_openmp.cpp
-              za svaki korak:
-                 sim.refresh_terrain_halo()                       (serijski, O(W + H))
-                 za y: kernels.flux(F, c, b, y)                   faza 1
-                 za y: kernels.water(F, c, b, b_next, y)          faza 2
-                 za y: kernels.sediment(F, c, y)                  faza 3
-                 sim.swap_terrain()
-```
-
-`KernelSet` je struktura od **tri pokazivača na funkcije** (`FluxRowFn`, `WaterRowFn`, `SedimentRowFn`), svaka obrađuje
-**jedan red**. Dakle, indirektni poziv se plaća po redu (jednom na `W` ćelija), a ne po ćeliji, i zanemarljiv je.
-Varijanta je kombinacija *„kako računam red"* (`KernelSet`) i *„ko računa koje redove"* (`Driver`).
-
-### Ko šta čita i piše
-
-Ovo je tabela koja opravdava paralelizaciju:
-
-| Faza | Čita | Piše | Posljedica |
-|---|---|---|---|
-| 1 | `b`, `d` (ćelija + 4 susjeda); `fL,fR,fT,fB` (samo svoje); maske | `fL,fR,fT,fB` (samo svoje) | susjedi se samo čitaju iz polja koja faza ne mijenja (`b`, `d`) |
-| 2 | `d`, `s`, `fL..fB` (svoje); `fR[l]`, `fL[r]`, `fB[t]`, `fT[bt]` (susjedi); `b_src` (ćelija + 4 susjeda) | `b_dst`, `s`, `sr`, `d` (samo svoje) | protoci susjeda su gotovi iz faze 1; teren ide u drugi bafer |
-| 3 | `s` (svoje); `sr`, `fL..fB` (ćelija + susjedi) | `s` (samo svoje) | susjedi čitaju `sr` i `f*`, a upisuje se samo `s[i]` |
-
-Zaključci:
-
-1. **Unutar jedne faze nema race condition-a** – svaka ćelija piše isključivo svoje elemente, a susjede čita iz nizova
-   koje ta faza ne mijenja. Zato se redovi mogu dijeliti dretvama, a ćelije u redu SIMD trakama.
-2. **Između faza postoji prava zavisnost** (faza 2 čita rezultate faze 1 u *susjednim* ćelijama), pa je potrebna
-   **barijera**: sve ćelije faze *k* moraju biti gotove prije početka faze *k+1*. U OpenMP-u je to implicitna barijera
-   na kraju `parallel for` / `omp for`.
-3. Faza 1 **ne upisuje `d`**; kišu računa lokalno (`d1 = d + r·dt`), a faza 2 je ponovo računa istom formulom. Tako
-   susjed u fazi 1 uvijek vidi staru vrijednost `d`, bez obzira na to koja je dretva prva stigla.
-
----
-
-## 5. Varijante i kerneli na niskom nivou
-
-| Varijanta | Kernel (fajl) | Driver | Šta ona mjeri |
-|---|---|---|---|
-| **A_scalar** | `kernels_scalar.cpp` | serijski | referenca, vektorizacija isključena |
-| **B_auto** | `kernels_auto.cpp` + `kernels_branchless.inl` | serijski | automatska vektorizacija kompajlera |
-| **C_omp_simd** | `kernels_omp_simd.cpp` | serijski | `#pragma omp simd` |
-| **D_avx2** | `kernels_avx2.cpp` | serijski | ručni AVX2 intrinsics |
-| **E_omp** | kao A | `omp parallel for` | samo dretve |
-| **F_omp_simd** | kao C | `omp parallel for` | dretve + `omp simd` |
-| **G_omp_avx2** | kao D | `omp parallel for` | dretve + AVX2 |
-| A2_scalar_branchless | `kernels_scalar_branchless.cpp` (izvor B) | serijski | ablacija: efekat grananja |
-| E2_omp_region | kao A | `omp parallel` + `omp for` | ablacija: jedna paralelna regija |
-| F2_omp_simd_region | kao C | `omp parallel` + `omp for` | ablacija: jedna paralelna regija |
-| H_omp_auto | kao B | `omp parallel for` | dretve + auto-vektorizacija |
-
-Registar je u `src/variants.cpp` (`main_variants()`, `ablation_variants()`). Varijante koje traže AVX2 ili OpenMP,
-a računar ih ne podržava, `variant_supported()` preskače (u `info` izlazu piše `[NIJE PODRZANO]`).
-
-### 5.1 A – skalarna referenca (`kernels_scalar.cpp`)
-
-Petlja po `x` poziva `ref::flux_cell / water_cell / sediment_cell` za svaku ćeliju. Vektorizacija je isključena na tri
-nivoa: zastavice kompajlera za cijeli fajl (GCC `-fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize`,
-Clang `-fno-vectorize -fno-slp-vectorize`), makro `SW_NO_VECTORIZE` ispred svake petlje (`#pragma loop(no_vector)` na
-MSVC-u) i provjera u izvještaju (izvještaj o vektorizaciji za ovaj fajl mora biti prazan, a disasembler ne smije
-sadržavati pakovane instrukcije – vidi `results/vectorization/disassembly_summary.txt`: 0 `ymm`, 0 pakovanih, 104
-skalarne `*ss`). Ovdje se koriste grananja (`if (nl < 0) nl = 0;`, `if (denom < tiny) …`).
-
-### 5.2 B i A2 – kod pisan za auto-vektorizaciju (`kernels_branchless.inl`)
-
-Isto tijelo (bez `if` u petlji, sa `std::min/max`/ternarnim izrazima) uključuje se u **dva prevodna fajla** s različitim
-zastavicama: `kernels_auto.cpp` (kompajler vektorizuje) i `kernels_scalar_branchless.cpp` (vektorizacija isključena –
-ablacija A2). Razlika A → A2 mjeri efekat uklanjanja grananja (pogrešna predviđanja skokova), a A2 → B čisti efekat SIMD-a.
-
-Šta je bilo potrebno da GCC 13 vektorizuje petlje:
-
-- **`__restrict` na parametrima funkcije** (`flux_row_impl(…, const float* SW_RESTRICT b, …)`), a pokazivači na red iznad
-  i ispod (`b − P`, `b + P`) prosljeđuju se kao zasebni parametri. GCC ne koristi pouzdano `restrict` na lokalnim
-  pokazivačima; prva verzija je tražila previše runtime provjera preklapanja (*„versioning for alias required"*) i
-  odustajala (`results/vectorization/gcc_report_v1_initial.txt`).
-- **Uslovi kao `min/max/?:`** – kompajler ih pretvara u SIMD maske (if-conversion). Dijeljenja i korijeni računaju se
-  bezuslovno (npr. `1/(L·max(dmean, min_depth))`), a rezultat se zatim bira, pa nema dijeljenja nulom.
-- **`-fno-math-errno`** – bez ovoga `sqrt` postavlja `errno` i petlja se ne može vektorizovati.
-- **`-fno-trapping-math`** – bez ovoga GCC javlja *„not vectorized: control flow in loop"*, jer množenje rezultatom
-  `min/max` izraza može izazvati FP izuzetak i ne smije se spekulativno izvršiti. Vrijednosti se ne mijenjaju (nema
-  reasocijacije ni FTZ promjena), što potvrđuju bit-identični testovi. Clang ovo ima po defaultu.
-
-### 5.3 C – `#pragma omp simd` (`kernels_omp_simd.cpp`)
-
-`SW_OMP_SIMD` (makro oko `_Pragma("omp simd")` / `__pragma(omp simd)`) je **obećanje programera** da su iteracije
-unutrašnje petlje nezavisne, pa kompajler vektorizuje bez analize preklapanja pokazivača i bez cost-modela koji bi
-vektorizaciju mogao odbiti (zato ovdje nema `__restrict`). Obećanje je tačno jer u svakoj fazi iteracija `x` piše samo
-elemente s indeksom `x`. Direktiva **ne pokreće dretve** – to radi tek `omp parallel for`. Uz podrazumijevani
-`-ftrapping-math` ni ovo nije bilo dovoljno, pa se fajl prevodi s `-fno-trapping-math` (isto kao B).
-
-### 5.4 D – AVX2 intrinsics (`kernels_avx2.cpp`)
-
-Jedan `__m256` sadrži 8 `float`; petlja korača po 8 (`kSimdFloats = 8`), a ostatak reda (`W % 8` ćelija) obrađuje
-skalarna referenca iz `cell_ops.hpp`.
-
-| Skalarno | AVX2 | Napomena |
-|---|---|---|
-| `if (x < 0) x = 0` / `max(x, 0)` | `_mm256_max_ps(zero, x)` | operandi su poredani tako da se poklapaju sa semantikom `std::max` (rezultat za NaN i ±0 je isti) |
-| `min(1, vol/denom)` | `_mm256_min_ps(one, div)` | |
-| `nl *= openL[x]` | `_mm256_mul_ps(…, _mm256_load_ps(openL + x))` | maska zida kao množenje |
-| `inv = (dmean > min_depth) ? … : 0` | `_mm256_cmp_ps(…, _CMP_GT_OQ)` + `_mm256_and_ps` | maska pa AND – nulira trake koje ne zadovoljavaju uslov |
-| `rate = (diff > 0) ? dt_ks : dt_kd` | `_mm256_blendv_ps(dtkd, dtks, mask)` | izbor po maski |
-| `sqrt`, `/` | `_mm256_sqrt_ps`, `_mm256_div_ps` | `vsqrtps`, `vdivps` |
-| `(d[i−1] + rain)` | `_mm256_loadu_ps(d + x − 1)` | neporavnano; centar i `±pitch` su poravnati |
-
-Fajl se prevodi s `-mavx2` (MSVC: `/arch:AVX2`) i poziva se **samo ako `avx2_supported()` vrati true**. Ta provjera
-(`src/cpu_features.cpp`) čita `CPUID` list 1 (bitovi `OSXSAVE` i `AVX`), `XGETBV` (operativni sistem čuva XMM i YMM
-registre) i `CPUID` list 7 (EBX bit 5 = AVX2) – ne vjeruje samo procesoru nego i OS-u. Na ne-x86 platformama
-(`PRS_ENABLE_AVX2=OFF`) `kernels_avx2()` vraća kernele iz B (`"avx2(fallback:auto)"`).
-
-Računska cijena po ćeliji i koraku: **4 dijeljenja i 2 kvadratna korijena** (faza 1: `vol/denom`; faza 2: `1/(L·dmean)`,
-`g²/(1+g²)`, `(s1·dt)/(d1·L²)` i dva `sqrt`). Te instrukcije su mnogo sporije od sabiranja i množenja, pa su (uz
-promet prema memoriji) razlog zašto ubrzanje od vektorizacije nije puna širina od 8× – ovo je objašnjenje iz analize
-koda, ne rezultat profilisanja.
-
-### 5.5 Drajveri (`driver_serial.cpp`, `driver_openmp.cpp`)
-
-**Serijski** – tri petlje po `y` unutar petlje po koracima, kao u dijagramu u [odjeljku 4](#4-kako-teče-jedan-korak).
-
-**`omp parallel for` (E, F, G, H)** – tri `#pragma omp parallel for schedule(static) num_threads(threads)` po koraku,
-dakle **fork-join po fazi**. `schedule(static)` daje svakoj dretvi jedan kontinuirani blok od ≈ `H/p` redova (jeftino i
-dobro za lokalnost keša, jer susjedni redovi pripadaju istoj dretvi). Barijera je implicitna na kraju svake petlje.
-Halo terena i `swap_terrain()` izvršava glavna dretva, serijski.
-
-**`omp parallel` + `omp for` (E2, F2)** – jedna paralelna regija za sve korake, tako da se tim dretvi ne formira
-iznova u svakoj fazi. Halo i zamjenu bafera radi jedna dretva (`#pragma omp single`, s implicitnom barijerom). Mjerenja
-pokazuju da je razlika u odnosu na fork-join zanemariva pri ovim veličinama mreže.
-
-**False sharing** – dretve pišu u različite redove; redovi su poravnati na 32 B, a `pitch·4 B ≥ 64 B`, pa granica
-između dva bloka redova dijeli najviše jednu liniju keša po nizu. Efekat je zanemariv.
-
-**Flush-to-zero / denormals-are-zero** – `enable_flush_denormals()` postavlja bitove 15 (FTZ) i 6 (DAZ) u `MXCSR`
-(`_mm_setcsr(_mm_getcsr() | 0x8040)`). Subnormalni brojevi (< ~1,18·10⁻³⁸, npr. sediment koji eksponencijalno opada u
-suhim ćelijama) inače mogu usporiti izvršavanje višestruko. `MXCSR` je registar **po dretvi**, pa se poziva u svakoj
-dretvi tima, a za sve varijante – i serijske – isto, da poređenje ostane fer. Komentar u kodu se oslanja na to da OpenMP
-runtime ponovo koristi iste dretve za naredne paralelne regije s istim brojem dretvi.
-
----
-
-## 6. Zašto su rezultati bit-identični
-
-Rezultat svake varijante poredi se s A bit-po-bit (`compare_states`), pa mora važiti da sve izvršavaju **iste IEEE-754
-operacije istim redoslijedom**:
-
-1. **Jedna specifikacija** – `cell_ops.hpp`; svi kerneli ponavljaju iste izraze, uključujući redoslijed sabiranja
-   (npr. `(((nl + nr) + nt) + nb)`), a ne neki algebarski ekvivalentan.
-2. **`-ffp-contract=off`** – kompajler ne smije spojiti `a·b + c` u FMA (jedno zaokruživanje umjesto dva). Na MSVC-u
-   se koristi `/fp:precise`.
-3. **Bez `-ffast-math`** – nema reasocijacije, zamjene dijeljenja množenjem recipročne vrijednosti niti pretpostavke da
-   nema NaN/Inf. `-fno-math-errno` i `-fno-trapping-math` mijenjaju samo to da li se `errno`/FP izuzeci postavljaju, ne
-   izračunate vrijednosti.
-4. **Iste konstante** – sve dolaze iz `StepConstants`, izračunate jednom u `float`.
-5. **Particija ne mijenja redoslijed** – svaka ćelija se računa sama od sebe (nema redukcija po ćelijama), pa broj
-   dretvi i način podjele redova ne utiču na vrijednosti.
-
-Posljedica: `prs_tests` za sve varijante i sve dimenzije/brojeve dretvi prijavljuje `bit-identicno` (280 od 280
-poređenja i na Linuxu i na Windowsu).
-
----
-
-## 7. Build sistem
-
-`CMakeLists.txt` pravi statičku biblioteku **`prs_core`** (sav kod osim `main`), izvršni program **`prs_swe`**
-(`src/main.cpp`) i test program **`prs_tests`** (`tests/correctness_tests.cpp`, registrovan kao CTest test `correctness`).
-Zastavice se postavljaju **po izvornom fajlu**, jer se ista logika namjerno prevodi na različite načine:
-
-| Fajl(ovi) | Zastavice (GCC/Clang) | Svrha |
-|---|---|---|
-| svi (PUBLIC) | `-Wall -Wextra -Wpedantic -ffp-contract=off -fno-math-errno` (MSVC: `/W4 /EHsc /fp:precise /utf-8`) | bit-identičnost; `/utf-8` jer izvori sadrže dijakritike |
-| `kernels_scalar.cpp`, `kernels_scalar_branchless.cpp` | `-fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize` (Clang: `-fno-vectorize -fno-slp-vectorize`) | A i A2 bez vektorizacije |
-| `kernels_auto.cpp`, `kernels_omp_simd.cpp`, `kernels_scalar_branchless.cpp` | `-fno-trapping-math` | omogućava if-konverziju |
-| `kernels_auto.cpp`, `kernels_omp_simd.cpp`, `kernels_avx2.cpp`, `kernels_scalar_branchless.cpp` | `-mavx2` (MSVC: `/arch:AVX2`) | ista širina vektora (256 b) za B, C, D radi fer poređenja |
-| `prs_core` (kad je OpenMP uključen) | `-fopenmp` (MSVC: `/openmp:experimental`) | dretve i `omp simd` |
-
-Napomena: A (`kernels_scalar.cpp`) se prevodi **bez** `-mavx2`, tj. kao skalarni kod osnovnog skupa instrukcija.
-
-### CMake opcije
-
-| Opcija | Zadano | Efekat |
-|---|---|---|
-| `PRS_ENABLE_OPENMP` | ON | OpenMP dretve i `omp simd`. Ako runtime nije pronađen: `-fopenmp-simd` (GCC/Clang), višedretvene varijante se preskaču |
-| `PRS_ENABLE_AVX2` | ON | `-mavx2` i AVX2 kernel (samo x86; inače `D`/`G` koriste kod iz B) |
-| `PRS_VECTORIZATION_REPORTS` | OFF | izvještaji kompajlera o vektorizaciji (`-fopt-info-vec-*`, `-Rpass=loop-vectorize`, `/Qvec-report:2`) |
-| `PRS_BUILD_TESTS` | ON | gradi `prs_tests` |
-
-Ako `CMAKE_BUILD_TYPE` nije zadan (jednokonfiguracioni generatori), koristi se **Release**.
-
-`include/build_info.hpp.in` se pri konfigurisanju pretvara u `generated/build_info.hpp` (kompajler, tip builda,
-zastavice). Taj tekst ispisuju `prs_swe info`, `bench` i `prs_tests`, pa je svako mjerenje vezano za tačne zastavice
-kojima je dobijeno.
-
----
-
-## 8. Pokretanje u detalje
-
-### 8.1 Preduslovi
-
-| Šta | Zašto | Provjera |
-|---|---|---|
-| CMake ≥ 3.16 | build | `cmake --version` |
-| C++20 kompajler | `std::aligned_alloc`, `<filesystem>`, … | Windows: Visual Studio 2022 ili 2026 s radnim opterećenjem „Desktop development with C++"; Linux: `g++ --version` |
-| AVX2 procesor | varijante D i G (i B, C, H kad je AVX2 build) | `prs_swe info` ispisuje `AVX2 (runtime): da/ne` |
-| Python 3 + `numpy` + `matplotlib` | samo grafikoni | `py -m pip install numpy matplotlib` |
-
-### 8.2 Windows – demo skripta
+### Komandna linija (bez pitanja – za skripte i ponovljive eksperimente)
 
 ```bat
-scripts\demo.cmd [-Full] [-SkipBuild] [-SkipTests] [-NoOpen]
+prs_erosion --input assets\heightmaps\primjer_3\mali-otocic-height-map-16bit-texturemap-app-2026-11-08.png --rain 100 --hours 5
+prs_erosion --input teren.png --rain 50 --hours 2 --runoff 1 --cell 10 --min 200 --max 900 --boundary open
+prs_erosion --input teren.jpg --rain 100 --hours 1 --invert --out output\moj_test --csv
+prs_erosion --help
 ```
 
-`demo.cmd` je samo omotač koji pokreće `demo.ps1` s `-ExecutionPolicy Bypass` (važi samo za to pokretanje).
-Skripta redom izvršava:
-
-| Korak | Šta radi |
-|---|---|
-| 1 | Ako `build-vs\CMakeCache.txt` ne postoji, konfiguriše CMake (generator „Visual Studio 18 2026" ili, ako njega nema, „Visual Studio 17 2022", `-A x64`), pa gradi `--config Release -j` |
-| 2 | `prs_swe info` |
-| 3 | `prs_tests` → `demo_out\correctness_report.csv`, `demo_out\correctness_tests_output.txt` |
-| 4 | `prs_swe bench` s mrežama i brojevima dretvi prilagođenim računaru → `demo_out\benchmarks.csv`, `benchmark_runs.csv`, `benchmark_output.txt` |
-| 5 | `prs_swe stream --threads 1,<jezgre>` → `demo_out\stream.csv` |
-| 6 | `prs_swe simulate --size 512 --steps 6000 --variant G_omp_avx2 --snap 1500` → `demo_out\sim512\` |
-| 7 | Traži Python s `numpy`+`matplotlib`; ako ga nađe, pravi grafikone u `demo_out\figures\` |
-
-| Opcija | Efekat |
-|---|---|
-| *(bez opcija)* | brzi režim: mreže 128, 256, 512; 3 ponavljanja, 1 warm-up; oko 2–3 min |
-| `-Full` | mreže 128–1024; 10 ponavljanja, 2 warm-up; nekoliko minuta duže |
-| `-SkipBuild` | preskače izgradnju (ako je `build-vs\` već izgrađen) |
-| `-SkipTests` | preskače testove (≈ 35 s) |
-| `-NoOpen` | ne otvara folder s grafikonima na kraju |
-
-Lista dretvi se pravi iz broja **fizičkih** jezgri (npr. 6 jezgri → `1,2,4,6`). Skripta piše samo u `demo_out\`
-(folder je u `.gitignore`).
-
-### 8.3 Windows – ručno
-
-```bat
-:: 1) konfiguracija (cmake --help ispisuje dostupne generatore; za VS 2022 je "Visual Studio 17 2022")
-cmake -G "Visual Studio 18 2026" -A x64 -S . -B build-vs
-
-:: 2) izgradnja – Visual Studio je višekonfiguracioni generator, pa se Release bira ovdje
-cmake --build build-vs --config Release -j
-
-:: 3) pokretanje; izvršni fajlovi su u build-vs\Release\
-build-vs\Release\prs_swe.exe info
-build-vs\Release\prs_tests.exe
-ctest --test-dir build-vs -C Release
-```
-
-Alternativa: u Visual Studiju `File → Open → Folder…` i odabrati korijen projekta (generiše `out\build\…`).
-
-### 8.4 Linux / macOS
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-bash scripts/run_benchmarks.sh      # kompletan postupak, vidi dolje
-```
-
-`scripts/run_benchmarks.sh` (piše u `results/`, namijenjena Linuxu/macOS-u):
-
-1. gradi `build/`,
-2. `system_info.sh` → `results/system_info.txt` (koristi `lscpu`, `free`, `/proc/cpuinfo`),
-3. `prs_tests` → `results/correctness_report.csv`, `results/correctness_tests_output.txt`,
-4. izvještaji kompajlera (zaseban build `build-vecreport` s `PRS_VECTORIZATION_REPORTS=ON`) → `results/vectorization/compiler_report.txt`,
-5. `stream` i `bench` (mreže 128–1024, 1/2/4/8 dretvi, 10 ponavljanja) + dodatno 1000² i 250² (širina nije višekratnik od 8),
-6. `simulate` 512², 6000 koraka, pa `visualize_simulation.py` i `plot_results.py`.
-
-### 8.5 Načini rada programa `prs_swe`
-
-```
-prs_swe info
-prs_swe bench    [opcije]
-prs_swe simulate [opcije]
-prs_swe stream   [opcije]
-```
-
-Bez argumenata program radi kao `info`. Opcije su oblika `--ime vrijednost`; opcija bez vrijednosti je zastavica.
-Veličina mreže može biti `512` (⇒ 512×512) ili `250x130`.
-
-#### `info`
-
-Ispisuje CPU (iz CPUID), broj logičkih jezgri, AVX2, OpenMP (broj dretvi), opis builda, `dt`/CFL limit i listu
-varijanti sa oznakom `[NIJE PODRZANO]` gdje je to slučaj.
-
-#### `bench` – mjerenje performansi
-
-| Opcija | Zadano | Značenje |
+| Opcija | Značenje | Podrazumijevano |
 |---|---|---|
-| `--sizes` | `128,256,512,1024` | mreže koje se mjere |
-| `--threads` | `1,2,4,8` | brojevi dretvi za višedretvene varijante |
-| `--reps` | `10` | broj mjerenih ponavljanja |
-| `--warmup` | `1` | broj zagrijavanja (ne mjere se) |
-| `--spinup` | `200` | koraka prije mjerenja da „voda već teče" |
-| `--updates` | `8388608` (2²³) | ćelija-koraka po mjerenju; `steps = max(4, round(updates / (W·H)))`, tj. 512/128/32/8 koraka za 128²/256²/512²/1024² |
-| `--e2e-threads` | `2` | broj dretvi u mjerenju cijele simulacije |
-| `--e2e-factor` | `10` | cijela simulacija radi 10× više koraka od mjerenja jezgra |
-| `--no-e2e` | – | preskače mjerenje cijele simulacije |
-| `--no-ablation` | – | preskače A2, E2, F2, H |
-| `--variants` | sve | npr. `A_scalar,G_omp_avx2` (A se uvijek mjeri jer je baza ubrzanja) |
-| `--out` | `results/benchmarks.csv` | glavni CSV |
-| `--runs-out` | `results/benchmark_runs.csv` | CSV pojedinačnih ponavljanja |
+| `--input`, `--rain`, `--hours` | height mapa, ukupna kiša [L/m²], trajanje [h] | obavezno |
+| `--cell`, `--min`, `--max` | veličina ćelije [m], visina crnog i bijelog piksela [m] | 30, 0, 100 |
+| `--terrain-json` | metapodaci iz birača terena (zadano `<ime slike>.terrain.json` pored slike) | – |
+| `--invert` | bijelo = najniže | ne |
+| `--runoff` | period oticanja nakon kiše [h] | 0 |
+| `--boundary` | `closed` (zid) ili `open` (voda i sediment mogu izaći) | closed |
+| `--manning` | Manningov koeficijent n [s/m^(1/3)] | 0.04 |
+| `--infiltration`, `--evaporation` | gubici vode [mm/h] | 0, 0 |
+| `--kc`, `--ks`, `--kd` | kapacitet [s/m], brzina erozije i taloženja [1/s] | 0.5, 0.02, 0.02 |
+| `--max-concentration`, `--min-slope` | granice kapaciteta | 0.1, 0 |
+| `--erodible-depth` | debljina erodibilnog sloja [m] (0 = neograničeno) | 5 |
+| `--no-erosion`, `--no-settle` | samo tok vode / bez taloženja preostalog sedimenta na kraju | – |
+| `--courant`, `--max-dt` | Courantov broj, najveći korak [s] | 0.7, 10 |
+| `--out`, `--csv` | izlazni folder, dodatni CSV | `output/<ime>` |
 
-Primjeri:
+Kodovi izlaza: 0 uspjeh, 1 neispravni argumenti, 2 mapa nije učitana, 3 simulacija prekinuta, 4 greška izvoza.
+
+## 4. Kako se učitava height mapa
+
+- Podržano: **PNG** (8 i 16 bita; sivo, sivo+alfa, RGB, RGBA) i **JPEG** (`.jpg`, `.jpeg`). Format se
+  prepoznaje iz sadržaja datoteke; dekodira se bibliotekom stb_image.
+- **16-bitni PNG se čita bez gubitka** (65536 nivoa visine). 8-bitni ulaz ima samo 256 nivoa.
+- Siva vrijednost: sivi kanal; za RGB slike u kojima je R = G = B uzima se R (bez gubitka), inače luma
+  ITU-R BT.709 (`0.2126 R + 0.7152 G + 0.0722 B`). Alfa kanal se zanemaruje.
+- Visine se interno čuvaju kao `double` u metrima: `h = min + (piksel / maks_vrijednost) · (max − min)`.
+  Simulacija se nikad ne radi nad `uint8` pikselima.
+- **Fizička skala:** slika ne zna koliko metara je piksel ni koliki je visinski raspon. Za teren s karte to
+  dolazi iz `.terrain.json`; inače se zadaje (veličina ćelije, minimalna i maksimalna visina), podrazumijevano
+  **30 m po pikselu, 0–100 m** – pretpostavke modela, ne stvarne geografske dimenzije.
+- **JPEG** je kompresija s gubicima: artefakti (blokovi 8×8, "zvonjenje" uz ivice) postaju lažne neravnine
+  terena koje voda "vidi"; program na to upozorava. Za najbolje rezultate koristiti 16-bitni PNG.
+- Primjeri iz priloga su u [`assets/heightmaps/`](assets/heightmaps/README.md) (412×221, 554×554, 736×736).
+- Solver ne prima putanju do slike nego apstraktni teren (`Heightmap`). Birač terena na karti puni isti objekat
+  preko 16-bitnog PNG-a i `.terrain.json` (veličina ćelije, min/max visina), pa ručni unos skale otpada.
+
+## 5. Kako se interpretiraju padavine
 
 ```
-prs_swe bench --sizes 128,256,512,1024 --threads 1,2,4,8 --reps 10 --warmup 2
-prs_swe bench --sizes 512 --threads 1,2 --variants G_omp_avx2,F_omp_simd --no-e2e
-prs_swe bench --sizes 1000,250 --threads 1,2 --no-e2e --no-ablation --out results/bench_nm8.csv
+1 L/m² = 1 mm vodenog stuba = 0.001 m
+intenzitet = ukupno / trajanje:   100 L/m² za 5 h  →  20 mm/h  =  5.556·10⁻⁶ m/s
+u svakom koraku:  Δd = intenzitet · (dio intervala [t, t+Δt] koji pada u period kiše)
 ```
 
-Poslije svake izmjerene mreže CSV se odmah upisuje (prekinuto mjerenje ne gubi djelimične rezultate). Ako ijedna
-varijanta odstupi od reference van tolerancije (`1e-5` apsolutno / `1e-4` relativno), program ispiše `GRESKA: …` i
-vrati kod izlaza **2**.
+Kiša je ravnomjerna u prostoru i vremenu. U koraku se dodaje samo voda koja padne **u tom koraku** (nikad
+ukupna količina po koraku ili po satu), pa je zbir tačno jednak unesenoj količini bez obzira na adaptivni korak.
+Trajanje kiše je **simulirano fizičko vrijeme** (5 h = 18000 s), ne vrijeme izvršavanja. Period oticanja je
+**zaseban** parametar i ne skraćuje niti produžava kišu.
 
-#### `simulate` – jedna kompletna simulacija sa snimcima
+## 6. Kako funkcioniše metoda virtuelnih cijevi
 
-| Opcija | Zadano | Značenje |
+Teren je mreža ćelija (jedan piksel = jedna ćelija). Svaka ćelija je virtuelnom cijevi povezana s 4 susjeda i
+za svaku cijev pamti izlazni protok f [m³/s]. U svakom koraku:
+
+1. **Visine vodenih površina** η = b + d (teren + voda) – voda teče prema nižoj **površini**, ne prema nižem terenu.
+2. **Protok kroz cijev** raste zbog razlike hidrostatičkog pritiska i opada zbog trenja (Manning, poluimplicitno):
+   ```
+   f_novo = max(0, (f + Δt · g · h_f · Δη) / (1 + Δt · g · n² · f / (l · h_f^(7/3))))
+   ```
+   gdje je h_f stvarna dubina toka između dvije ćelije, a l veličina ćelije (Mei 2007 + Bates i dr. 2010).
+3. **Ograničenje dostupnom vodom:** ako bi ćelija u koraku poslala više vode nego što ima, svi njeni izlazni
+   protoci se skaliraju faktorom `K = min(1, d · l² / (Σf · Δt))` → dubina nikad ne postaje negativna.
+4. **Nova dubina:** `d ← d + Δt · (Σ ulaz − Σ izlaz) / l²` – voda se samo premješta, pa je ukupna količina
+   očuvana (zatvoreni rubovi: na kraju je na terenu tačno sva kiša; provjereno u svakom koraku).
+5. **Brzina** iz neto protoka kroz ćeliju i srednje dubine: `u = ΔW_x / (l · d̄)`.
+
+Korak Δt je **adaptivan**: `Δt = 0.7 · l / max(2√(g d) + |u|)` (uslov stabilnosti eksplicitne šeme; faktor 2
+je posljedica dvije izlazne cijevi po paru ćelija u Mei modelu – vidi dokumentaciju). Rubovi su zatvoreni (zid)
+ili otvoreni (slobodan izliv, izlaz se evidentira).
+
+## 7. Kako nastaju erozija i depozicija
+
+1. **Kapacitet transporta** – koliko materijala tekuća voda može nositi:
+   `C = min(K_c · sin α · |v|, 0.1) · d` [m], gdje je α nagib vodene površine, |v| brzina, d dubina
+   (Mei: `K_c · sin α · |v|`; množenje dubinom daje količinu materijala, a nagib površine sprječava da mirna
+   duboka voda u jezeru kopa dno).
+2. **Erozija** (voda nosi manje nego što može, C > s): teren se snižava, a sediment u vodi povećava za
+   `(1 − e^(−K_s Δt)) · (C − s)`, najviše do debljine erodibilnog sloja (5 m).
+3. **Depozicija** (voda nosi više nego što može, C < s): višak `(1 − e^(−K_d Δt)) · (s − C)` se taloži i
+   povisuje teren.
+4. **Transport sedimenta** kroz iste cijevi kao voda: ćelija šalje susjedu onaj dio sedimenta koji odgovara dijelu
+   vode koji je otišao kroz tu cijev. Šta jedna ćelija pošalje, druga tačno primi → **materijal (teren +
+   sediment) je očuvan**.
+5. Na kraju se sediment koji je još u vodi taloži na mjestu gdje se nalazi.
+
+Erozija se dešava tamo gdje voda brzo teče niz nagib (jaruge, padine), a taloženje tamo gdje usporava (doline,
+bare, podnožje).
+
+## 8. Kako se izvozi erodirana mapa
+
+Za ulaz `planina.png` program pravi `output/planina/`:
+
+| Datoteka | Sadržaj |
+|---|---|
+| **`planina_eroded.png`** | **erodirana height mapa**: 16-bitni sivi PNG, iste dimenzije i orijentacija, **ista visinska skala** (min/max) kao ulaz – nema nezavisne normalizacije, boje vode ni filtera |
+| `planina_original.png` | ulaz zapisan na isti način (16 bita, ista skala) – za direktno poređenje |
+| `planina_difference.png` | Δh = poslije − prije: crveno = sniženje (erozija), plavo = povišenje (depozicija); skala boja je u izvještaju |
+| `planina_comparison.png` | sjenčeni reljef originala (lijevo) i rezultata (desno), isto osvjetljenje i isti z-faktor |
+| `planina_water_max_depth.png` | najveća dubina vode tokom simulacije – gdje su nastali vodeni tokovi |
+| `planina_*_m.npy` | sirovi podaci u metrima, float64 bez gubitka (original, eroded, difference, water_max_depth) |
+| `planina_eroded_m.csv` | uz `--csv`: visine s 17 značajnih cifara |
+| `simulation_report.txt`, `simulation_report.json` | parametri, broj koraka, Δt, vrijeme izvršavanja, bilansi vode i materijala, statistika promjena, upozorenja |
+
+Ako erodirani teren izađe iz raspona `[min, max]` (npr. taloženje na najvišem pikselu), vrijednosti se u PNG-u
+odsijeku **uz upozorenje** u konzoli i izvještaju, a tačne vrijednosti ostaju u `.npy`. Originalna ulazna
+datoteka se nikad ne mijenja (izvoz se odbija ako bi izlaz imao istu putanju).
+
+Python skripta za uporedni prikaz s bojama u metrima (opciono):
+
+```bash
+python scripts/visualize_results.py output/planina --save output/planina/figure.png
+```
+
+## 9. Kompajliranje
+
+| Šta | Komanda / vrijednost |
+|---|---|
+| Konfiguracija (Windows) | `cmake -S . -B build-vs -G "Visual Studio 17 2022" -A x64` (ili `"Visual Studio 18 2026"`) |
+| Build (Windows) | `cmake --build build-vs --config Release` → `build-vs\Release\prs_erosion.exe`, `prs_erosion_tests.exe` |
+| Konfiguracija + build (Linux/macOS) | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` |
+| Ciljevi | `prs_erosion_core` (biblioteka), `prs_erosion` (program), `prs_erosion_tests` (testovi) |
+| Opcije | `PRS_BUILD_TESTS` (ON) |
+| Zastavice | C++20; MSVC `/W4 /EHsc /utf-8 /permissive-`; GCC/Clang `-Wall -Wextra -Wpedantic`; Release optimizacija (`/O2`, `-O3`). **Bez** `/openmp`, `-fopenmp`, `/arch:AVX2`, `-mavx2` |
+
+**Šta je stvarno provjereno:**
+- Linux (Intel Xeon 2.1 GHz, 2 vCPU): čist build od nule sa **GCC 13.3 + CMake 3.28** bez ijednog upozorenja,
+  testovi **44/44 (306 provjera)**, program pokrenut na sva tri priložena primjera. Cijeli tok birač → lokalni
+  server → program → simulacija provjeren u headless Chromiumu sa simuliranim visinskim pločicama (poznata funkcija
+  visine, greška 2 mm); preuzimanje stvarnih pločica provjereno u Chromeu (Bjelašnica: 1000–2058 m, 1,9 s).
+- Windows (Visual Studio 2026, MSBuild 18.11): projekat je izgrađen i pokrenut na računaru autora (meni, unos,
+  simulacija). Kasnije dodani dijelovi (lokalni server s Winsockom, `Pokreni.cmd`) na Windowsu treba potvrditi s
+  `.\Pokreni test`.
+
+## 10. Testovi
+
+`prs_erosion_tests` sadrži testove 1–10 iz specifikacije i dodatne provjere (44 testa, 306 provjera); svi
+prolaze. Pokreće se iz korijena projekta (da nađe primjere u `assets/heightmaps`) ili preko CTest-a:
+
+```bash
+./build/prs_erosion_tests            # Windows: build-vs\Release\prs_erosion_tests.exe
+ctest --test-dir build               # Windows: ctest --test-dir build-vs -C Release
+```
+
+| Test | Šta dokazuje |
+|---|---|
+| 1 – bez kiše | 0 L/m²: nema toka ni erozije, height mapa bit-identična |
+| 2 – ravan teren | uniformna kiša na ravnom terenu: svi protoci i brzine tačno 0, voda svuda tačno jednaka |
+| 3 – nagib | voda teče niz nagib i skuplja se dolje; padina se snižava, podnožje povisuje |
+| 4 – planina | erozija lokalizovana na tokovima, depozicija niže; i na stvarnoj mapi iz priloga |
+| 5 – količina kiše | 10/50/100/200 L/m²: tabela, bilansi; više kiše → više erozije (nelinearno) |
+| 6 – trajanje | 100 L/m² za 1/5/10 h: vršni protok opada s trajanjem (manji intenzitet) |
+| 7 – očuvanje vode | `voda na terenu = kiša` poslije svakog koraka (relativna greška ≤ 5·10⁻¹⁵) |
+| 8 – očuvanje materijala | `Σ(teren + sediment)` konstantno u svakom koraku (rel. ~10⁻¹¹), i uz otvoren rub |
+| 9 – stabilnost | strm teren, 200 L/m²: nema NaN/Inf, negativne vode/sedimenta ni eksplozije |
+| 10 – uvoz/izvoz | PNG 8/16 bita, RGB, alfa, JPEG, nekvadratne mape, ista skala, ulaz netaknut |
+
+Uz njih grupa `TerrainReceiver` (2 testa) provjerava lokalni server (stranica, upload s tokenom, odbijanje pogrešnog
+tokena, tuđeg `Host` zaglavlja i neispravnih podataka, čišćenje imena), a grupa `TerrainMetadata` (7 testova) provjerava čitanje metapodataka birača terena, preračun razmjere kad se slika
+smanji, traženje najnovijeg izvoza i učitavanje 16-bitnog PNG-a koji je napravio preglednik (`tests/data/`).
+
+Detalji: [tests/README.md](tests/README.md) i [docs/ALGORITHM_EXPLANATION.md, odjeljak 10](docs/ALGORITHM_EXPLANATION.md#10-kako-je-provjerena-ispravnost).
+
+## 11. Izmjereni rezultati
+
+Stvarna pokretanja `prs_erosion` na priloženim 16-bitnim mapama, podrazumijevana skala (30 m po pikselu,
+0–100 m), zatvoreni rubovi. Okruženje: Linux VM, Intel Xeon @ 2.1 GHz, GCC 13.3, Release, **jedna dretva**.
+Na desktop procesoru (npr. i5-9400) očekuje se kraće vrijeme. Tabele se mogu ponovo dobiti skriptom
+`python scripts/run_experiments.py --exe <putanja do prs_erosion>`.
+
+**100 L/m², 1 h i 5 h (vrijeme izvršavanja):**
+
+| Mapa | Mreža | 1 h kiše: koraka / vrijeme | 5 h kiše: koraka / vrijeme | Sniženo (1 h) | Max sniženje / povišenje (1 h) |
+|---|---|---|---|---|---|
+| primjer_1 | 412×221 | 2151 / 9.6 s | 10546 / 44–46 s | 222 663 m³ | 0.22 m / 0.73 m |
+| primjer_2 | 554×554 | 2326 / 29.5 s | 12270 / 150 s | 650 380 m³ | 0.59 m / 1.00 m |
+| primjer_3 | 736×736 | 2027 / 51.8 s | 10399 / 238 s | 440 511 m³ | 0.38 m / 0.80 m |
+
+**Test 5 (primjer_1, 1 h):** 10 / 50 / 100 / 200 L/m² → sniženo 8 669 / 85 886 / 222 663 / 547 921 m³, max
+sniženje 0.009 / 0.084 / 0.223 / 0.718 m. Erozija raste brže od količine kiše (20× više kiše → 63× više
+sniženog materijala), jer dublji i brži tok ima veći kapacitet.
+
+**Test 6 (primjer_1, 100 L/m²):** 1 / 5 / 10 h (100 / 20 / 10 mm/h) → sniženo 222 663 / 155 286 / 126 373 m³:
+ista količina kiše jačeg intenziteta erodira više ukupno, dok duža kiša daje dublje lokalne usjeke
+(max sniženje 0.22 / 0.47 / 0.44 m).
+
+Bilansi u svim pokretanjima: relativna greška vode ≤ 4·10⁻¹³, materijala ≤ 5·10⁻¹⁰ (zaokruživanje u `double`).
+
+![primjer_3, 100 L/m² za 1 h: original, erodirana mapa (ista skala), razlika u metrima, najveća dubina vode](docs/images/primjer_3_100mm_1h.png)
+
+*primjer_3 (736×736), 100 L/m² za 1 h: erozija (crveno) prati kanale i obalu ostrva, taloženje (plavo) je u
+dolinama i podnožju; gore desno je erodirana mapa u istoj skali boja kao original (promjene su reda cm–dm na
+reljefu od 100 m, pa se vide tek na mapi razlike). Slika: `scripts/visualize_results.py`.*
+
+### Koliko traje simulacija
+
+```
+trajanje ≈ broj ćelija × broj koraka × ~50 ns        broj koraka ≈ (sati kiše + sati oticanja) · 3600 / Δt
+Δt = 0.7 · veličina ćelije / max(2·√(g·dubina) + brzina)   (najviše 10 s; određuje ga najdublja/najbrža voda)
+```
+
+Izmjereno na terenu u formatu birača (`tests/data/terrain_picker_sample`: sintetički reljef 5,8 × 5,8 km, visine
+1000–1900 m; manje dimenzije su ista mapa smanjena), zatvoren rub, jedna dretva, Linux VM:
+
+| Parametar | Pokretanja | Koraka | Vrijeme | Zaključak |
+|---|---|---|---|---|
+| **dimenzija slike** (100 mm, 1 h) | 128 / 256 / 512 px (ćelije 45 / 22,6 / 11,3 m) | 1 431 / 3 216 / 7 002 | 0,8 / 9,3 / 75 s | ×2 dimenzija → ×4 ćelija i ×2 koraka ≈ **×8 vremena** |
+| **količina kiše** (256 px, 1 h) | 50 / 100 / 200 mm | 2 554 / 3 216 / 3 963 | 7,0 / 9,3 / 10,2 s | ×2 kiše → ~+25 % koraka (brzina talasa ~ √dubina) |
+| **trajanje** (256 px, 100 mm) | 1 h / 2 h kiše / 1 h + 1 h oticanja | 3 216 / 7 093 / 8 263 | 9,3 / 21,7 / 21,0 s | linearno sa simuliranim vremenom; oticanje nije jeftinije |
+
+Iz toga: 1024 px na istom području ≈ 10 min, 2048 px ≈ 80 min po satu kiše (procjena). Za probu je dovoljno
+256–512 px; izvorni podaci karte ionako imaju rezoluciju oko 30 m. Ova zavisnost (dimenzija³ × vrijeme) je
+motivacija za naredne faze (OpenMP, GPU): sve petlje po ćelijama su nezavisne unutar faze (vidi dokumentaciju,
+odjeljak 13).
+
+## 12. Ograničenja numeričkog modela
+
+- Hidraulika bez advekcijskog člana (lokalna inercijalna aproksimacija) – dobra za tok po terenu, manje tačna za
+  nagle hidrauličke skokove.
+- Erozija je empirijska: K_c, K_s, K_d i c_max su koeficijenti modela (kao kod Mei i Šťave), nisu kalibrisani
+  na mjerenjima; apsolutne količine treba tumačiti kvalitativno.
+- Za mape iz fajla skala terena je pretpostavka korisnika; rezultati zavise od veličine ćelije i visinskog raspona.
+- Teren s karte: izvorni podaci (SRTM / EU-DEM) imaju rezoluciju ~30 m i opisuju površinu (moguće i krošnje),
+  ne samo golo tlo; manje ćelije samo interpoliraju.
+- Jedan materijal (bez slojeva tla, vegetacije), bez termalne erozije/klizanja kosina, kiša ravnomjerna u
+  prostoru, infiltracija i isparavanje samo kao konstantne brzine (podrazumijevano isključeni).
+- 8-bitni i JPEG ulazi imaju stepenice/artefakte koje model tretira kao stvarne neravnine.
+- Eksplicitna šema: najdublja bara određuje Δt za cijelu mrežu; serijsko izvršavanje je sporo za velike mape i
+  duge kiše.
+- Zatvoreni rub pravi bare uz rub mape; otvoreni rub je slobodan izliv.
+
+Detaljnije: [docs/ALGORITHM_EXPLANATION.md, odjeljak 12](docs/ALGORITHM_EXPLANATION.md#12-ograničenja-modela).
+
+## 13. Razlike u odnosu na fazu 1
+
+**Zašto redizajn.** Raniji program `prs_swe` je bio benchmark performansi, a ne alat koji od height mape
+pravi erodiranu height mapu:
+
+| Zahtjev | Faza 1 (`prs_swe`) | Faza 2 (`prs_erosion`) |
 |---|---|---|
-| `--size` | `512` | mreža |
-| `--steps` | `4000` | broj koraka |
-| `--variant` | `G_omp_avx2` | bilo koja varijanta iz tabele |
-| `--threads` | `2` | broj dretvi |
-| `--snap` | `1000` | svakih toliko koraka snima `water_*.npy` i `terrain_*.npy` (`0` = ne snima) |
-| `--diag` | `50` | svakih toliko koraka upisuje red u `diagnostics.csv` |
-| `--out` | `results/sim` | izlazni folder |
-| `--rain --kc --ks --kd --ke --dt` | iz `SimParams` | zamjena parametara modela |
+| Ulaz: height mapa PNG/JPEG | nema – teren se generiše (fBm šum, `src/terrain.cpp`) | PNG 8/16 bita i JPEG, skala koju zadaje korisnik |
+| Kiša u L/m² tokom zadatih sati | nema – konstanta u kodu `rain_rate = 0.002 m/s` (= 7200 mm/h) | ukupno [L/m²] + trajanje [h] → intenzitet, tačna raspodjela po koracima |
+| Fizičko vrijeme | zadaje se broj koraka (Δt ≈ 0.05 s) | adaptivni Δt do kraja kiše i perioda oticanja (sati) |
+| Izlaz | `.npy` snimci (float32) i CSV mjerenja | erodirana 16-bitna PNG height mapa u istoj skali + izvještaj |
+| Tok vode | Mei cijevi s konstantnim presjekom A = 1 m², bez trenja | presjek l·h_f, Manningovo trenje, CFL s faktorom 2 |
+| Erozija/transport | Mei bez Δt; konzervativni transport | relaksacija s Δt, kapacitet × dubina, nagib vodene površine; isti konzervativni transport |
+| Fokus i izvršavanje | brzina 11 varijanti (SIMD, AVX2, OpenMP), ~3 min demo | ispravnost modela, serijski, testovi 1–10 |
+
+Iz faze 1 su zadržane provjerene ideje: struktura Mei modela (protoci → voda → erozija → transport), ograničenje
+odljeva K, konzervativni transport sedimenta kroz cijevi (`include/cell_ops.hpp`), dvostruko baferovanje i
+raspored podataka po poljima (SoA) – sve prepisano čitljivije, u `double` preciznosti i bez SIMD/OpenMP koda.
+
+Kod faze 1 (`src/kernels_*`, `src/driver_*`, `src/simulation.cpp`, `src/terrain.cpp`, `include/cell_ops.hpp`, …),
+njeni testovi, benchmark skripte, rezultati mjerenja (`results/`) i generator ranijeg seminarskog dokumenta
+**uklonjeni su iz radnog stabla**. Ništa nije izgubljeno: sve je u git historiji, posljednje stanje faze 1 je commit
+`78e7b52` (`git show 78e7b52 --stat`, `git checkout 78e7b52 -- <putanja>`).
+
+## 14. Struktura projekta
 
 ```
-prs_swe simulate --size 512 --steps 6000 --variant G_omp_avx2 --threads 4 --snap 1500 --diag 100 --out demo_out/sim512
+PRS-Projekat1/
+├── CMakeLists.txt              biblioteka prs_erosion_core, program prs_erosion, testovi prs_erosion_tests
+├── Pokreni.cmd                 izgradi (samo izmjene) i pokreni program; "Pokreni test" = testovi
+├── assets/heightmaps/          primjeri height mapa iz priloga (3 × PNG 16-bit, PNG 8-bit, tekstura)
+├── include/                    zaglavlja (Grid2D, Heightmap, HeightmapIO, Rainfall, SimulationConfig,
+│                               SimulationState, VirtualPipesSolver, HydraulicErosion, ErosionSimulation,
+│                               ImageWriter, ResultExport, ConsoleInput, TerrainMetadata, LocalTerrainServer, MathUtils)
+├── src/                        implementacija (main.cpp = konzolni interfejs)
+├── tests/                      prs_erosion_tests (testovi 1–10, metapodaci, lokalni server) + tests/data
+├── third_party/stb/            stb_image, stb_image_write (MIT / Public Domain)
+├── tools/                      terrain_picker.html – birač terena na karti (šalje PNG + .terrain.json programu)
+├── scripts/                    erosion_demo.cmd/.ps1, run_experiments.py, visualize_results.py, (un)instaliraj_pokreni.cmd
+├── docs/                       ALGORITHM_EXPLANATION.md, literature_review.md, slike
+├── references/                 BibTeX literatura
+├── output/                     rezultati simulacija (ne verzionišu se)
+└── tereni/                     tereni primljeni iz birača (ne verzionišu se)
 ```
 
-Ako se vrijednosti u nekom koraku ne mogu predstaviti (NaN/Inf), program prekida s greškom *„Simulacija je postala
-nestabilna"*.
+Slojevi: **numerika** (`VirtualPipesSolver`, `HydraulicErosion`, `ErosionSimulation`) ← **model terena**
+(`Heightmap`, `TerrainMetadata`) ← **ulaz/izlaz** (`HeightmapIO`, `ImageWriter`, `ResultExport`,
+`LocalTerrainServer`) ← **konzola** (`main.cpp`, `ConsoleInput`). Numerika ne zavisi od konzole, mreže ni od
+biblioteke za slike.
 
-#### `stream` – propusnost memorije
+## 15. Literatura, reference i licence
 
-STREAM *triad* `a[i] = b[i] + s·c[i]` nad tri niza, svaki `--mb` MB (zadano 128, dovoljno veliko da ne stane u keš).
-Promet je `3·4·n` bajtova; ispisuje GB/s (medijan i najbolje) za svaki broj dretvi iz `--threads` (zadano `1,2,4,8`) i
-upisuje `--out` (zadano `results/stream.csv`). Služi za poređenje „koliko memorija može" naspram „koliko kernel treba".
-`--mb 12` mjeri sa nizom koji stane u L3 keš.
+- X. Mei, P. Decaudin, B.-G. Hu, "Fast Hydraulic Erosion Simulation and Visualization on GPU", Pacific Graphics
+  2007. DOI: 10.1109/PG.2007.15
+- O. Šťava, B. Beneš, M. Brisbin, J. Křivánek, "Interactive Terrain Modeling Using Hydraulic Erosion", SCA 2008,
+  str. 201–210. DOI: 10.2312/SCA/SCA08/201-210
+- P. D. Bates, M. S. Horritt, T. J. Fewtrell, "A simple inertial formulation of the shallow water equations for
+  efficient two-dimensional flood inundation modelling", Journal of Hydrology 387, 2010.
+  DOI: 10.1016/j.jhydrol.2010.03.027
+- Ostatak literature i obrazloženje svake razlike u odnosu na izvorne radove: [docs/ALGORITHM_EXPLANATION.md](docs/ALGORITHM_EXPLANATION.md#14-literatura).
 
-### 8.6 Testovi
+Pregledane referentne implementacije (kod **nije** kopiran; implementacija je vlastita):
+[dandrino/terrain-erosion-3-ways](https://github.com/dandrino/terrain-erosion-3-ways) (MIT; erozija česticama /
+po gradijentu, nije model cijevi),
+[juanguillermo-dev/terrain-erosion-simulation](https://github.com/juanguillermo-dev/terrain-erosion-simulation)
+(DirectX prikaz terena s teselacijom; simulacija erozije nije implementirana),
+[lanlou123/Webgl-Erosion](https://github.com/lanlou123/Webgl-Erosion) (MIT; GPU model cijevi po Mei 2007),
+[Tangram Heightmapper](https://tangrams.github.io/heightmapper/) (MIT; uzor za birač terena – koristi iste
+visinske pločice, ali izvozi sliku bez metapodataka o razmjeri).
 
-```bash
-./build/prs_tests [izlazni_csv]                 # Linux
-build-vs\Release\prs_tests.exe [izlazni_csv]     # Windows
-ctest --test-dir build                           # preko CTest-a (Windows: ctest --test-dir build-vs -C Release)
-```
+Birač terena (`tools/terrain_picker.html`, vlastita implementacija): visine iz
+[AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Mapzen, Terrarium format; SRTM data courtesy of
+the U.S. Geological Survey; Produced using Copernicus data and information funded by the European Union - EU-DEM
+layers), karta OpenTopoMap (CC-BY-SA, © OpenStreetMap contributors) i Esri, biblioteka Leaflet 1.9.4 (BSD-2).
 
-Bez argumenta CSV se upisuje u `correctness_report.csv` u tekućem folderu. Završni red je
-`Ukupno: 335 uspjesnih, 0 neuspjesnih`, a kod izlaza je 0 samo ako nema neuspjelih testova.
-
-### 8.7 Grafikoni
-
-```bash
-python3 scripts/visualize_simulation.py results/sim512 results/figures    # slike simulacije iz .npy
-python3 scripts/plot_results.py results results/figures                    # grafikoni performansi iz CSV-ova
-```
-
-(Windows: `py -3 …`.) `visualize_simulation.py` pravi `sim_terrain_before_after`, `sim_terrain_difference`,
-`sim_water_evolution`, `sim_water_velocity`, `sim_mass_balance` i `sim_summary.txt`. `plot_results.py` pravi
-`perf_speedup_variants`, `perf_throughput`, `perf_thread_scaling`, `perf_bandwidth`, `perf_kernel_vs_e2e` i
-`perf_branch_simd_decomposition`; broj fizičkih jezgri čita iz reda `Core(s) per socket` u `system_info.txt`.
-
-### 8.8 Okruženje OpenMP
-
-Broj dretvi u `bench`/`simulate` zadaje se **opcijom `--threads`** (prosljeđuje se kao `num_threads(p)`), a ne
-`OMP_NUM_THREADS`; ta varijabla utiče samo na ispis maksimuma u `info`. Broj dretvi treba uskladiti s brojem
-**fizičkih** jezgri – s više dretvi nego jezgri dobija se *oversubscription*, a ne skaliranje. Za stabilna mjerenja s
-GCC OpenMP runtime-om (libgomp) preporučuje se:
-
-```bash
-OMP_PROC_BIND=close OMP_PLACES=cores ./build/prs_swe bench …
-```
-
-(PowerShell: `$env:OMP_PROC_BIND = "close"`.)
-
-### 8.9 Rješavanje problema
-
-| Simptom | Uzrok / rješenje |
-|---|---|
-| `info`: `AVX2 (runtime): ne`, varijante `[NIJE PODRZANO]` | procesor/OS ne podržava AVX2; preskaču se sve varijante čiji je kernel preveden s `-mavx2` (A2, B, C, D, F, F2, G, H), a rade A, E i E2 |
-| `Varijanta nije podrzana na ovom racunaru` | `simulate --variant …` traži varijantu koja nije podržana; izaberite npr. `A_scalar` |
-| `GRESKA: … odstupa od reference` (kod 2) | varijanta daje rezultat izvan tolerancije; pokrenuti `prs_tests` da se vidi koja |
-| `Neispravni parametri` / `dt * K_s … moraju biti <= 1` | zadani `--dt/--ks/--kd/--ke` krše uslov stabilnosti relaksacije |
-| `Nije pronadjen Visual Studio 2022/2026 generator` | instalirati VS s C++ opterećenjem, ili ručno zadati generator ([8.3](#83-windows--ručno)) |
-| Skripta se ne pokreće (execution policy) | koristiti `scripts\demo.cmd`, ne `demo.ps1` direktno |
-| Grafikoni se preskaču | nema Pythona s `numpy`+`matplotlib`: `winget install Python.Python.3.13`, pa `py -m pip install numpy matplotlib` |
-| `grep` ne nalazi tekst u `demo_out\*.txt` | PowerShell 5.1 ih upisuje kao UTF-16; otvoriti u editoru ili pretvoriti u UTF-8 |
-| Nakon demoa se pojavio prazan `results\` | `prs_swe stream` bezuslovno poziva `create_directories("results")`; bezopasno |
-| Višedretvene varijante nedostaju | OpenMP nije pronađen pri konfigurisanju (provjeriti poruku CMake-a) |
-
----
-
-## 9. Izlazni fajlovi
-
-### `benchmarks.csv` (jedan red = jedna varijanta × broj dretvi × mjera)
-
-| Kolona | Značenje |
-|---|---|
-| `grid, W, H, cells` | mreža |
-| `variant, label, kernels, driver` | varijanta, opis, `KernelSet`, drajver (`serial`, `omp_parallel_for`, `omp_region`) |
-| `measure` | `kernel` (samo koraci) ili `e2e` (alokacija + teren + koraci + dijagnostika) |
-| `threads, steps, reps, warmups` | parametri mjerenja |
-| `median_ms, min_ms, max_ms, mean_ms, stddev_ms, cv_percent` | statistika vremena (uzoračka devijacija, `cv = 100·σ/μ`) |
-| `mcells_per_s` | `W·H·steps / median / 10⁶` |
-| `ns_per_cell_step` | `median·10⁹ / (W·H·steps)` |
-| `est_GBps` | `112·W·H·steps / median / 10⁹` (model prometa, vidi [odjeljak 3](#saobraćaj-prema-memoriji)) |
-| `speedup_vs_scalar` | `median(A) / median(varijanta)` – A je uvijek prvi u redoslijedu |
-| `speedup_vs_1thread_same_kernels` | ubrzanje u odnosu na **serijsku** varijantu s istim kernelima (npr. G naspram D) |
-| `parallel_efficiency` | prethodna kolona podijeljena brojem dretvi |
-| `bitwise_equal_to_scalar`, `max_abs_diff` | rezultat poređenja s referencom (samo za `kernel` redove) |
-| `checksum` | `state_checksum` stanja nakon mjerenja |
-
-Napomena: u `e2e` redovima kolona `bitwise_equal_to_scalar` je uvijek 1 (ne provjerava se).
-
-### `benchmark_runs.csv`
-
-`grid,variant,measure,threads,run,time_ms` – sva pojedinačna ponavljanja (za box-plot, test normalnosti, itd.).
-
-### `stream.csv`
-
-`threads,array_mb,median_ms,min_ms,GBps_median,GBps_best`.
-
-### `correctness_report.csv`
-
-`test,detail,result,value` – jedan red po provjeri (`PASS`/`FAIL`).
-
-### Folder simulacije (`simulate --out DIR`)
-
-| Fajl | Sadržaj |
-|---|---|
-| `terrain_initial.npy` | početni teren |
-| `water_NNNNNN.npy`, `terrain_NNNNNN.npy` | snimci na svakih `--snap` koraka |
-| `terrain_final.npy`, `water_final.npy`, `sediment_final.npy`, `speed_final.npy` | završno stanje; brzina toka iz protoka i trenutne dubine |
-| `diagnostics.csv` | `step,time_s,water_m3,terrain_m3,sediment_m3,terrain_plus_sediment_m3,max_depth_m,min_depth_m,min_sediment_m,rain_added_m3` |
-| `meta.txt` | `W, H, steps, dt, cell_size, variant, threads, wall_time_s` i parametri modela |
-
-`.npy` je NumPy format verzije 1.0: magic `\x93NUMPY`, zaglavlje s `{'descr': '<f4', 'fortran_order': False, 'shape': (H, W)}`
-dopunjeno razmacima do višekratnika od 64 B, pa **sirovi little-endian `float32`** niz u row-major poretku. U Pythonu:
-`numpy.load("terrain_final.npy")`. Halo i padding se ne snimaju (`extract()` kopira samo unutrašnjost).
-
----
-
-## 10. Metodologija mjerenja
-
-- **Početno stanje:** teren + *spin-up* (200 koraka skalarnom varijantom, izvan mjerenja) – voda već teče, što je
-  realističnije od praznog stanja; isto stanje dobijaju sve varijante (`copy_state_from`).
-- **Referenca:** skalarna varijanta A iz istog početnog stanja; svako mjerenje se poredi s njom (`compare_states`).
-- **Vrijeme:** `std::chrono::steady_clock`; `prepare()` (vraćanje početnog stanja) **nije** u mjerenom vremenu;
-  `atomic_signal_fence` s obje strane sprečava da kompajler pomjeri posao preko granice mjerenja; warm-up se ne računa.
-- **Sprečavanje eliminacije koda:** `consume(observe())` XOR-uje bite kontrolne sume u globalni atomic, pa kompajler ne
-  može odbaciti „neiskorišten" rad.
-- **Statistika:** medijan (otporan na ispade), min, max, srednja vrijednost i uzoračka standardna devijacija;
-  izvještava se medijan.
-- **Količina rada:** po mjerenju je ≈ 2²³ ćelija-koraka za svaku mrežu, pa su vremena različitih mreža uporediva.
-- **Jezgro naspram cijele simulacije:** `measure=kernel` mjeri samo korake; `measure=e2e` uključuje alokaciju,
-  generisanje terena i dijagnostiku (10× više koraka).
-- **Memorija:** `stream` daje gornju granicu propusnosti za poređenje s `est_GBps`.
-
----
-
-## 11. Testovi
-
-`tests/correctness_tests.cpp` – 335 provjera (`280 + 11 + 7·6 + 2`):
-
-| Test | Šta provjerava | Prag | Broj |
-|---|---|---|---|
-| ekvivalencija sa referencom | svaka od 11 varijanti, na mrežama 8×8, 13×7, 37×29, 64×64, 100×75, 127×129, 250×250, 257×255, 300 koraka; višedretvene s 1, 2, 3, 4, 8 dretvi | `1e-5` apsolutno / `1e-4` relativno, a prijavljuje se i `bit-identicno` | 280 |
-| halo i padding netaknuti | na 29×11 (`W % 8 ≠ 0`) niko ne piše van unutrašnjosti | tačno 0 | 11 |
-| jezero u mirovanju | ravna površina vode, bez kiše i isparavanja, 1000 koraka: protoci, voda i teren se ne mijenjaju | tačno 0 | 7 |
-| bilans vode | `W_{n+1} = (W_n + N·r·dt)·(1 − K_e·dt)` svaki korak | relativna greška < 1e-5 (izmjereno ≈ 1,5e-8) | 7 |
-| očuvanje teren + sediment | 1500 koraka na 127×129 | relativno < 1e-6 (izmjereno ≈ 2e-7), sediment > 0 | 7 |
-| nenegativnost i stabilnost | 3000 koraka | `d ≥ 0`, `s ≥ 0`, sve konačno | 7 |
-| zatvoreni rubovi | izlazni protok kroz rub domene | tačno 0 | 7 |
-| simetrija lijevo–desno | simetričan teren daje simetrično rješenje | 0 neslaganja (bit-egzaktno) | 7 |
-| CFL | traženi `dt = 10 s` se ograničava na limit; 3000 koraka na limitu je stabilno | `dt ≤ limit`, `max d < 1000 m` | 2 |
-
-Fizikalni testovi (jezero, bilans, očuvanje, simetrija, rubovi) se rade za A–G; ekvivalencija i padding za svih 11 varijanti.
-Širine koje nisu višekratnik od 8 (13, 37, 127, 257, 29, 61…) namjerno pokrivaju skalarni ostatak u AVX2 petljama.
-
----
-
-## 12. Rezultati
-
-Rezultati u repozitoriju (`results/`) izmjereni su na virtuelnoj mašini s **2 vCPU** (Intel Xeon @ 2,10 GHz, KVM),
-GCC 13.3, Ubuntu 24.04. Mjerenja s 4 i 8 dretvi na toj mašini su zato mjerenja **prekomjernog opterećenja**
-(oversubscription), a ne skaliranja. Za rezultate na vlastitom računaru pokrenuti `scripts\demo.cmd` (Windows) ili
-`scripts/run_benchmarks.sh` (Linux/macOS).
-
-### Linux VM (GCC 13.3, 2 vCPU), mreža 1024², medijan od 10 ponavljanja
-
-| Varijanta | dretve | medijan [ms] | Mcell/s | ubrzanje naspram A |
-|---|---|---|---|---|
-| A_scalar | 1 | 220,2 | 38,1 | 1,00 |
-| A2_scalar_branchless | 1 | 193,4 | 43,4 | 1,14 |
-| B_auto | 1 | 34,6 | 242,7 | 6,37 |
-| C_omp_simd | 1 | 34,9 | 240,2 | 6,30 |
-| D_avx2 | 1 | 35,1 | 239,0 | 6,27 |
-| E_omp | 2 | 115,4 | 72,7 | 1,91 |
-| F_omp_simd | 2 | 21,2 | 396,2 | 10,40 |
-| H_omp_auto | 2 | 18,3 | 457,6 | 12,01 |
-| **G_omp_avx2** | **2** | **16,7** | **502,4** | **13,19** |
-
-### Windows (Intel Core i5-9400, 6 jezgri, MSVC 19.51), brzi režim `demo.cmd`, mreža 512², 3 ponavljanja
-
-| Varijanta | dretve | medijan [ms] | Mcell/s | ubrzanje naspram A |
-|---|---|---|---|---|
-| A_scalar | 1 | 274,4 | 30,6 | 1,00 |
-| B_auto | 1 | 247,8 | 33,8 | 1,11 |
-| D_avx2 | 1 | 35,2 | 238,6 | 7,81 |
-| E_omp | 6 | 49,0 | 171,3 | 5,60 |
-| F_omp_simd | 1 / 6 | 248,8 / 45,7 | 33,7 / 183,5 | 1,10 / 6,01 |
-| G_omp_avx2 | 1 / 2 / 4 / 6 | 36,6 / 18,2 / 12,0 / 11,1 | 229 / 461 / 699 / 754 | 7,50 / 15,08 / 22,85 / **24,67** |
-
-### Šta iz njih slijedi
-
-- **Vektorizacija sama** daje ≈ 6–8× (maksimum za 8 × `float` je 8×; razlika dolazi od dijeljenja, korijena i prometa
-  prema memoriji – [odjeljak 5.4](#54-d--avx2-intrinsics-kernels_avx2cpp)).
-- **Dretve** skaliraju skoro linearno dok ima fizičkih jezgri (efikasnost 0,92–1,00 za E i F do 6 dretvi na Windowsu).
-  Kombinacija **SIMD + dretve (G)** je najbrža: ≈ 13× na 2 jezgre (Linux) i ≈ 25× na 6 jezgri (Windows).
-- **Na GCC-u** su auto-vektorizacija, `omp simd` i ručni AVX2 praktično jednaki (≈ 6,3×): kad je kod napisan bez
-  grananja, s `__restrict` i uz `-fno-trapping-math`, kompajler vektorizuje jednako dobro kao ručni kod.
-- **Na MSVC-u to ne važi:** B_auto i F_omp_simd s jednom dretvom daju samo ≈ 1,1×, dok ručni AVX2 daje ≈ 7,8×. Uzrok
-  nije analiziran; za istragu postoji opcija `PRS_VECTORIZATION_REPORTS`.
-- **Ablacije** (A2, E2/F2, H) pokazuju male razlike: grananje donosi +14 % na 1024², ali −4 % na 512²; jedna OpenMP
-  regija naspram fork-join-a nema značajnog efekta.
-- **Šum:** na VM-u koeficijent varijacije ide do ≈ 8 %, pa pojedine ćelije (npr. D_avx2 sporiji od B_auto na 512²)
-  treba čitati oprezno; 1024² je pouzdanije. Kontrolno mjerenje je u `results/recheck_512_p1.csv`.
-
----
-
-## 13. Struktura repozitorija
-
-```
-CMakeLists.txt     build: biblioteka prs_core, programi prs_swe i prs_tests, zastavice po fajlu
-include/           simulation.hpp  – parametri, Fields, Simulation, KernelSet, Driver, Variant, dijagnostika
-                   cell_ops.hpp    – skalarna specifikacija jedne ćelije (faze 1–3)
-                   aligned_buffer.hpp, sw_common.hpp (makroi), benchmark.hpp (mjerenje i statistika),
-                   cpu_features.hpp, io_npy.hpp, build_info.hpp.in
-src/               kernels_scalar.cpp (A), kernels_branchless.inl + kernels_auto.cpp (B) +
-                   kernels_scalar_branchless.cpp (A2), kernels_omp_simd.cpp (C), kernels_avx2.cpp (D),
-                   driver_serial.cpp, driver_openmp.cpp, variants.cpp (registar),
-                   simulation.cpp (stanje, CFL, dijagnostika), terrain.cpp (početni teren),
-                   benchmark.cpp, cpu_features.cpp (CPUID, FTZ/DAZ), io_npy.cpp, main.cpp (info|bench|simulate|stream)
-tests/             correctness_tests.cpp
-scripts/           demo.cmd, demo.ps1          – Windows demonstracija (piše u demo_out/)
-                   run_benchmarks.sh, system_info.sh – Linux/macOS postupak (piše u results/)
-                   plot_results.py, visualize_simulation.py – grafikoni
-                   docgen/                     – generator Word dokumenta rada (Node.js)
-docs/              literature_review.md (pregled literature 2020–danas)
-references/        bibliography.bib
-results/           referentna mjerenja (Linux VM): CSV i TXT, vectorization/ (izvještaji GCC/Clang, disasembler)
-```
-
-**Generisani artefakti** (nastaju iz koda i skripti; nisu namijenjeni verzionisanju u gitu): `build/`, `build-vs/`,
-`out/`, `.vs/`, `demo_out/`, `results/figures/*.png`, `results/sim512/*.npy`, kao i Word dokument rada
-`docs/PRS_Shallow_Water_Terrain_Erosion_CPU.docx`.
-
-Word dokument se regeneriše iz `results/` (Node.js i paket `docx`, koji treba instalirati ručno – nema `package.json`):
-
-```bash
-npm install docx
-node scripts/docgen/build_document.js results docs/PRS_Shallow_Water_Terrain_Erosion_CPU.docx
-```
-
-(Pri otvaranju u Wordu prihvatiti ažuriranje polja da se popuni automatski sadržaj.) Generator čita `results/*.csv` i
-`results/vectorization/disassembly_summary.txt`; bez njih ne može da radi.
-
----
-
-## 14. Poznate napomene i ograničenja
-
-- **Dva izlazna foldera:** `scripts\demo.cmd` piše u `demo_out\`, a `run_benchmarks.sh` i podrazumijevane vrijednosti
-  opcija `--out` pišu u `results\`. Podaci iz `results\` (Linux VM) se demoom ne obnavljaju.
-- **`results/vectorization/`:** `run_benchmarks.sh` piše `compiler_report.txt`, a sačuvani fajlovi (`gcc_report_v1_initial`,
-  `gcc_report_final`, `clang18_report`, `disassembly_summary`) su dobijeni ručno; `gcc_report_v1_initial.txt` je izvještaj
-  ranije verzije koda.
-- **MSVC:** izgradnja i svih 335 testova prolaze (`/openmp:experimental`, `/arch:AVX2`), ali auto-vektorizacija i
-  `omp simd` ovdje ne daju ubrzanje (odjeljak 12). Mjerenja za rad rađena su s GCC-om na Linuxu.
-- **`demo.ps1`, korak 6:** ispis kaže „30 s simuliranog vremena", a 6000 koraka × 0,05 s je **300 s**.
-- **Procjena propusnosti** (`est_GBps`) je model prometa, ne mjerenje; za manje mreže radni skup stane u keš pa
-  vrijednost može premašiti STREAM.
-- **Samo CPU:** GPU (CUDA) faza nije dio ovog repozitorija; arhitektura (SoA, dvostruki bafer terena, halo, maske
-  zidova, skalarna referenca kao specifikacija) je projektovana da se preslika na CUDA bez promjene numeričkog modela.
-
----
-
-## 15. Literatura
-
-- X. Mei, P. Decaudin, B.-G. Hu, *Fast Hydraulic Erosion Simulation and Visualization on GPU*, Pacific Graphics 2007,
-  doi:10.1109/PG.2007.15 – model virtuelnih cijevi i erozija zasnovana na kapacitetu (osnova implementacije).
-- Pregled radova 2020–danas: [`docs/literature_review.md`](docs/literature_review.md); BibTeX: [`references/bibliography.bib`](references/bibliography.bib).
+Biblioteka **stb** (Sean Barrett, `third_party/stb`, MIT ili Public Domain po izboru) – vidi
+[third_party/stb/README.md](third_party/stb/README.md).

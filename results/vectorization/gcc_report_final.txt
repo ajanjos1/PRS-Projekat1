@@ -1,9 +1,0 @@
-src/kernels_branchless.inl:17:31: optimized: loop vectorized using 32 byte vectors
-src/kernels_branchless.inl:17:31: optimized: loop vectorized using 16 byte vectors
-src/kernels_branchless.inl:121:31: optimized: loop vectorized using 32 byte vectors
-src/kernels_branchless.inl:121:31: optimized: loop vectorized using 16 byte vectors
-src/kernels_branchless.inl:64:31: optimized: loop vectorized using 32 byte vectors
-src/kernels_branchless.inl:64:31: optimized: loop vectorized using 16 byte vectors
-src/kernels_omp_simd.cpp:51:36: optimized: loop vectorized using 32 byte vectors
-src/kernels_omp_simd.cpp:161:41: optimized: loop vectorized using 32 byte vectors
-src/kernels_omp_simd.cpp:102:36: optimized: loop vectorized using 32 byte vectors

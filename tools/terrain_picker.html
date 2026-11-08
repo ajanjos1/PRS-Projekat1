@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="bs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Birač terena – PRS erozija</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" crossorigin="">
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --ink: #1d2327; --muted: #5d676f; --line: #d9dcdf;
+    --accent: #1f6feb; --accent-ink: #ffffff; --warn: #9a5b00; --warn-bg: #fff4de; --err: #b3261e; --ok: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --panel: #1d2226; --ink: #e8eaec; --muted: #9aa5ad; --line: #343b41;
+      --accent: #4c8dff; --accent-ink: #0b1220; --warn: #f0b45a; --warn-bg: #2d2412; --err: #ff8a80; --ok: #56d364;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, "Segoe UI", Roboto, sans-serif; display: flex; }
+  #side { width: 380px; max-width: 45vw; min-width: 300px; height: 100%; overflow-y: auto; padding: 16px; background: var(--panel); border-right: 1px solid var(--line); }
+  #map { flex: 1; height: 100%; min-width: 0; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 13px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  p { margin: 6px 0; }
+  .muted { color: var(--muted); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  input[type=text], select { flex: 1; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+  button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.active { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+  td { padding: 3px 0; vertical-align: top; }
+  td:first-child { color: var(--muted); padding-right: 10px; white-space: nowrap; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .note { padding: 8px 10px; border-radius: 6px; margin: 8px 0; font-size: 13px; }
+  .warn { background: var(--warn-bg); color: var(--warn); }
+  .linked { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ink); border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); }
+  .sent { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ink); font-size: 14px; }
+  .err { color: var(--err); }
+  .ok { color: var(--ok); }
+  progress { width: 100%; height: 10px; }
+  canvas#preview { width: 100%; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #000; display: block; }
+  code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  footer { font-size: 11.5px; color: var(--muted); margin-top: 18px; border-top: 1px solid var(--line); padding-top: 10px; }
+  @media (max-width: 760px) { body { flex-direction: column-reverse; } #side { width: 100%; max-width: none; height: 55%; border-right: 0; border-top: 1px solid var(--line); } #map { height: 45%; flex: none; } }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1>Birač terena</h1>
+  <p class="muted">Odaberite dio Zemlje, a stranica će napraviti 16-bitnu height mapu i pripadni <code>.terrain.json</code>
+  (veličina ćelije, minimalna i maksimalna visina u metrima). Program <code>prs_erosion</code> ih zajedno učita i ništa ne treba unositi ručno.</p>
+
+  <div id="linked" class="note linked" hidden><b>Povezano s programom.</b> Nakon „Generiši teren“ height mapa i metapodaci se
+  automatski šalju u <code>prs_erosion</code> – ništa ne treba preuzimati.</div>
+
+  <h2>1. Područje</h2>
+  <div class="row"><input id="q" type="text" placeholder="Pretraga mjesta (npr. Bjelašnica)"><button id="go">Traži</button></div>
+  <div class="row">
+    <button id="draw">Nacrtaj pravougaonik</button>
+    <button id="view">Koristi trenutni pogled</button>
+    <button id="clear">Obriši</button>
+  </div>
+  <p class="muted" id="hint">Kliknite „Nacrtaj pravougaonik“, pa povucite mišem preko karte.</p>
+
+  <h2>2. Postavke</h2>
+  <div class="row"><label for="px" style="flex:1">Najveća dimenzija slike (px)</label>
+    <select id="px" style="flex:0 0 110px"><option>256</option><option selected>512</option><option>768</option><option>1024</option><option>1536</option><option>2048</option></select></div>
+  <div class="row"><label><input type="checkbox" id="sea" checked> Visine ispod 0 m (more) postavi na 0 m</label></div>
+  <table id="plan"></table>
+  <div id="planWarn"></div>
+
+  <h2>3. Generisanje</h2>
+  <div class="row"><button class="primary" id="make" disabled>Generiši teren</button></div>
+  <progress id="prog" value="0" max="1" hidden></progress>
+  <p id="status" class="muted"></p>
+  <canvas id="preview" hidden></canvas>
+  <table id="result"></table>
+  <div id="sentNote" class="note sent" hidden></div>
+  <div class="row" id="sendRow" hidden><button class="primary" id="send">Pošalji u program</button></div>
+  <div class="row" id="dl" hidden>
+    <button class="primary" id="dlBoth">Preuzmi oba fajla</button>
+    <button id="dlPng">Samo PNG</button>
+    <button id="dlJson">Samo JSON</button>
+  </div>
+  <div id="next" hidden>
+    <h2>Sljedeći korak</h2>
+    <p>U programu odaberite <b>„Odaberi teren na karti“</b> – on će sam naći preuzete fajlove (folder Preuzimanja).
+    Ili iz komandne linije (JSON pored PNG-a se učita automatski):</p>
+    <p><code id="cmd"></code></p>
+    <p class="muted">Ne mijenjajte ime PNG-a i JSON-a (razlikuju se samo po nastavku). Ako sliku kasnije smanjite, program sam preračuna veličinu ćelije.</p>
+  </div>
+
+  <footer>
+    Visine: AWS Terrain Tiles (Mapzen), globalni model terena izveden iz SRTM-a, EU-DEM-a i nacionalnih izvora.
+    <br>SRTM data courtesy of the U.S. Geological Survey. Produced using Copernicus data and information funded by the European Union - EU-DEM layers.
+    <br>Karta: OpenTopoMap (CC-BY-SA, © OpenStreetMap contributors), Esri. Pretraga: Nominatim / Photon.
+    <br>Stvarna rezolucija podataka je u većini svijeta oko 30 m; manje ćelije samo interpoliraju.
+  </footer>
+</div>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin=""></script>
+<script>
+"use strict";
+/* =====================================================================================================
+ *  JEZGRO (ne zavisi od karte): plan → preuzimanje Terrarium pločica → uzorkovanje → 16-bitni PNG + metapodaci
+ *  Dostupno kao window.TerrainPicker radi testiranja.
+ * ===================================================================================================== */
+const TerrainPicker = (() => {
+  const TILE = 256;
+  const R = 6378137;                    // radijus za Web Mercator (EPSG:3857)
+  const ORIGIN = Math.PI * R;           // polovina opsega svijeta u metrima
+  const MAX_ZOOM = 15;                  // najveći zum Terrarium pločica
+  const MAX_TILES = 400;
+  const MAX_LAT = 85.05;
+  const tileUrl = (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
+
+  const lonToMercX = lon => R * lon * Math.PI / 180;
+  const latToMercY = lat => R * Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+  const mercYToLat = my => (2 * Math.atan(Math.exp(my / R)) - Math.PI / 2) * 180 / Math.PI;
+  const mercXToLon = mx => mx / R * 180 / Math.PI;
+  // metri Mercatora -> koordinate u pikselima svijeta na zumu z (ishodište gore lijevo)
+  const worldPx = (mx, my, z) => { const s = TILE * 2 ** z; return [(mx + ORIGIN) / (2 * ORIGIN) * s, (ORIGIN - my) / (2 * ORIGIN) * s]; };
+
+  /** Plan bez preuzimanja: dimenzije slike, veličina ćelije u metrima, zum, broj pločica. Baca Error s razlogom. */
+  function plan(b, maxPx) {
+    const { south, west, north, east } = b;
+    if (![south, west, north, east].every(Number.isFinite)) throw new Error("Koordinate nisu ispravne.");
+    if (!(south < north) || !(west < east)) throw new Error("Područje je prazno.");
+    if (south < -MAX_LAT || north > MAX_LAT) throw new Error("Područje mora biti između -85° i 85° geografske širine.");
+    if (west < -180 || east > 180) throw new Error("Područje mora biti unutar -180° i 180° geografske dužine.");
+    const x0 = lonToMercX(west), x1 = lonToMercX(east), y0 = latToMercY(south), y1 = latToMercY(north);
+    const wM = x1 - x0, hM = y1 - y0;
+    const p = Math.max(wM, hM) / maxPx;                     // veličina piksela u metrima Mercatora
+    const W = Math.max(2, Math.round(wM / p)), H = Math.max(2, Math.round(hM / p));
+    // stvarno pokriveno područje (zaokruženo na cijele piksele; kvadratni pikseli)
+    const ax0 = x0, ay1 = y1, ax1 = x0 + W * p, ay0 = y1 - H * p;
+    const latC = mercYToLat((ay0 + ay1) / 2);
+    const cellSizeMeters = p * Math.cos(latC * Math.PI / 180);   // stvarna dužina stranice piksela na tlu
+    const zWanted = Math.ceil(Math.log2(2 * ORIGIN / (TILE * p)));
+    const zoom = Math.min(MAX_ZOOM, Math.max(0, zWanted));
+    const [pxA, pyA] = worldPx(ax0, ay1, zoom), [pxB, pyB] = worldPx(ax1, ay0, zoom);
+    const n = 2 ** zoom;
+    const tx0 = Math.max(0, Math.floor((pxA - 2) / TILE)), tx1 = Math.min(n - 1, Math.floor((pxB + 2) / TILE));
+    const ty0 = Math.max(0, Math.floor((pyA - 2) / TILE)), ty1 = Math.min(n - 1, Math.floor((pyB + 2) / TILE));
+    const tiles = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
+    return {
+      width: W, height: H, cells: W * H, cellSizeMeters, zoom, upsampled: zWanted > MAX_ZOOM,
+      tiles, tx0, tx1, ty0, ty1, p, ax0, ax1, ay0, ay1,
+      widthKm: W * cellSizeMeters / 1000, heightKm: H * cellSizeMeters / 1000,
+      bbox: { south: mercYToLat(ay0), west: mercXToLon(ax0), north: mercYToLat(ay1), east: mercXToLon(ax1) },
+    };
+  }
+
+  /** Terrarium piksel -> metri: (R*256 + G + B/256) - 32768 */
+  function decodeTerrarium(rgba, out) {
+    for (let i = 0, j = 0; i < rgba.length; i += 4, ++j) out[j] = rgba[i] * 256 + rgba[i + 1] + rgba[i + 2] / 256 - 32768;
+    return out;
+  }
+
+  async function fetchTileElevations(z, x, y) {
+    const r = await fetch(tileUrl(z, x, y), { mode: "cors" });
+    if (!r.ok) throw new Error(`Pločica ${z}/${x}/${y} nije dostupna (HTTP ${r.status}).`);
+    const bmp = await createImageBitmap(await r.blob(), { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+    const c = typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(bmp.width, bmp.height) : Object.assign(document.createElement("canvas"), { width: bmp.width, height: bmp.height });
+    const g = c.getContext("2d", { willReadFrequently: true });
+    g.drawImage(bmp, 0, 0);
+    if (bmp.width !== TILE || bmp.height !== TILE) throw new Error(`Neočekivana veličina pločice ${bmp.width}x${bmp.height}.`);
+    return decodeTerrarium(g.getImageData(0, 0, TILE, TILE).data, new Float32Array(TILE * TILE));
+  }
+
+  /** Preuzima pločice (po 8 istovremeno) i vraća mozaik. `fetchTile` se može zamijeniti u testovima. */
+  async function buildMosaic(pl, onProgress, fetchTile = fetchTileElevations) {
+    const nx = pl.tx1 - pl.tx0 + 1, ny = pl.ty1 - pl.ty0 + 1, mw = nx * TILE;
+    const mosaic = new Float32Array(mw * ny * TILE);
+    const jobs = []; for (let ty = pl.ty0; ty <= pl.ty1; ++ty) for (let tx = pl.tx0; tx <= pl.tx1; ++tx) jobs.push([tx, ty]);
+    let done = 0, next = 0, failure = null;
+    async function worker() {
+      while (!failure && next < jobs.length) {
+        const [tx, ty] = jobs[next++];
+        try {
+          let el, lastErr;
+          for (let attempt = 0; attempt < 3 && !el; ++attempt) {
+            try { el = await fetchTile(pl.zoom, tx, ty); } catch (e) { lastErr = e; }
+          }
+          if (!el) throw lastErr;
+          const ox = (tx - pl.tx0) * TILE, oy = (ty - pl.ty0) * TILE;
+          for (let r = 0; r < TILE; ++r) mosaic.set(el.subarray(r * TILE, (r + 1) * TILE), (oy + r) * mw + ox);
+          onProgress && onProgress(++done / jobs.length);
+        } catch (e) { failure = e; }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(8, jobs.length) }, worker));
+    if (failure) throw failure;
+    return { mosaic, mw, mh: ny * TILE };
+  }
+
+  /** Bilinearno uzorkovanje mozaika u mrežu W×H (kvadratni pikseli u Mercatoru). */
+  function resample(pl, m, clampSea) {
+    const { width: W, height: H } = pl;
+    const elev = new Float32Array(W * H);
+    const px0 = pl.tx0 * TILE, py0 = pl.ty0 * TILE;
+    let mn = Infinity, mx = -Infinity;
+    for (let j = 0; j < H; ++j) {
+      const my = pl.ay1 - (j + 0.5) * pl.p;
+      for (let i = 0; i < W; ++i) {
+        const mxm = pl.ax0 + (i + 0.5) * pl.p;
+        const [wx, wy] = worldPx(mxm, my, pl.zoom);
+        let fx = wx - 0.5 - px0, fy = wy - 0.5 - py0;               // centri piksela pločice su na +0.5
+        fx = Math.min(Math.max(fx, 0), m.mw - 1); fy = Math.min(Math.max(fy, 0), m.mh - 1);
+        const ix = Math.min(Math.floor(fx), m.mw - 2), iy = Math.min(Math.floor(fy), m.mh - 2);
+        const ux = fx - ix, uy = fy - iy;
+        const a = m.mosaic[iy * m.mw + ix], b = m.mosaic[iy * m.mw + ix + 1];
+        const c = m.mosaic[(iy + 1) * m.mw + ix], d = m.mosaic[(iy + 1) * m.mw + ix + 1];
+        let e = (a * (1 - ux) + b * ux) * (1 - uy) + (c * (1 - ux) + d * ux) * uy;
+        if (clampSea && e < 0) e = 0;
+        elev[j * W + i] = e;
+        if (e < mn) mn = e; if (e > mx) mx = e;
+      }
+    }
+    return { elev, min: mn, max: mx };
+  }
+
+  /** Cijeli postupak: vraća { width, height, data16, elev, min, max, cellSizeMeters, zoom, tiles, bbox }. */
+  async function buildTerrain(bounds, maxPx, opts = {}) {
+    const pl = plan(bounds, maxPx);
+    if (pl.tiles > MAX_TILES) throw new Error(`Područje traži ${pl.tiles} pločica (najviše ${MAX_TILES}). Smanjite područje ili dimenziju slike.`);
+    const m = await buildMosaic(pl, opts.onProgress, opts.fetchTile);
+    const { elev, min, max } = resample(pl, m, opts.clampSea !== false);
+    if (!(max - min > 1e-3)) throw new Error("Odabrano područje je potpuno ravno (jednaka visina svuda), pa nema šta erodirati.");
+    const data16 = new Uint16Array(elev.length), k = 65535 / (max - min);
+    for (let i = 0; i < elev.length; ++i) data16[i] = Math.round((elev[i] - min) * k);
+    return { ...pl, data16, elev, min, max };
+  }
+
+  /* ----------------------------------------------------------------- PNG (16-bit sivi) */
+  const crcTable = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; ++n) { let c = n; for (let k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  function crc32(bytes) { let c = 0xFFFFFFFF; for (let i = 0; i < bytes.length; ++i) c = crcTable[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  function chunk(type, data) {
+    const out = new Uint8Array(12 + data.length), dv = new DataView(out.buffer);
+    dv.setUint32(0, data.length);
+    for (let i = 0; i < 4; ++i) out[4 + i] = type.charCodeAt(i);
+    out.set(data, 8);
+    dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+    return out;
+  }
+  async function zlibDeflate(bytes) {
+    if (typeof CompressionStream === "undefined") throw new Error("Preglednik ne podržava CompressionStream. Koristite noviji Chrome, Edge ili Firefox.");
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));   // "deflate" = zlib okvir (kako PNG traži)
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  async function encodePng16(w, h, data16) {
+    const stride = w * 2, raw = new Uint8Array((stride + 1) * h);
+    for (let y = 0; y < h; ++y) {
+      const o = y * (stride + 1); raw[o] = 1;                       // filter 1 = Sub (bajtovi susjednog piksela: razmak 2)
+      const cur = new Uint8Array(stride);
+      for (let x = 0; x < w; ++x) { const v = data16[y * w + x]; cur[2 * x] = v >> 8; cur[2 * x + 1] = v & 255; }
+      for (let i = 0; i < stride; ++i) raw[o + 1 + i] = (cur[i] - (i >= 2 ? cur[i - 2] : 0)) & 255;
+    }
+    const ihdr = new Uint8Array(13), dv = new DataView(ihdr.buffer);
+    dv.setUint32(0, w); dv.setUint32(4, h); ihdr[8] = 16; ihdr[9] = 0; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    const sig = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
+    const parts = [sig, chunk("IHDR", ihdr), chunk("IDAT", await zlibDeflate(raw)), chunk("IEND", new Uint8Array(0))];
+    const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0)); let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    return out;
+  }
+
+  /* ----------------------------------------------------------------- metapodaci + imena fajlova */
+  function baseName(t) {
+    const lat = (t.bbox.south + t.bbox.north) / 2, lon = (t.bbox.west + t.bbox.east) / 2;
+    const f = (v, pos, neg, digits) => (v >= 0 ? pos : neg) + Math.abs(v).toFixed(3).padStart(digits + 4, "0");
+    return `teren_${f(lat, "N", "S", 2)}_${f(lon, "E", "W", 3)}_${t.width}x${t.height}`;
+  }
+  function makeMetadata(t, opts = {}) {
+    const base = baseName(t);
+    return {
+      formatVersion: 1,
+      heightmapFile: base + ".png",
+      width: t.width, height: t.height,
+      cellSizeMeters: Number(t.cellSizeMeters.toFixed(6)),
+      minElevationMeters: Number(t.min.toFixed(6)),
+      maxElevationMeters: Number(t.max.toFixed(6)),
+      encoding: "16-bit grayscale PNG; 0 = minElevationMeters, 65535 = maxElevationMeters (linearno)",
+      bbox: { south: Number(t.bbox.south.toFixed(6)), west: Number(t.bbox.west.toFixed(6)), north: Number(t.bbox.north.toFixed(6)), east: Number(t.bbox.east.toFixed(6)) },
+      source: "AWS Terrain Tiles (Mapzen), Terrarium, zoom " + t.zoom,
+      zoom: t.zoom, tiles: t.tiles, seaClamped: opts.clampSea !== false,
+      attribution: "SRTM data courtesy of the U.S. Geological Survey; Produced using Copernicus data and information funded by the European Union - EU-DEM layers; Mapzen/AWS Terrain Tiles",
+      createdBy: "PRS terrain_picker.html",
+    };
+  }
+
+  return { plan, buildTerrain, buildMosaic, resample, encodePng16, makeMetadata, baseName, decodeTerrarium, crc32 };
+})();
+window.TerrainPicker = TerrainPicker;
+
+/* =====================================================================================================
+ *  KORISNIČKI INTERFEJS (karta, odabir područja, preuzimanje)
+ * ===================================================================================================== */
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d = 1) => v.toLocaleString("bs", { minimumFractionDigits: d, maximumFractionDigits: d });
+  let bounds = null, rect = null, last = null, drawing = false, drawOn = false;
+
+  // Povezanost s programom: program otvara stranicu sa svog lokalnog servera (http://127.0.0.1:<port>/?token=...).
+  // Otvorena kao obični fajl, stranica radi kao i prije (samo preuzimanje).
+  const PROGRAM_TOKEN = (location.protocol === "http:" && ["127.0.0.1", "localhost"].includes(location.hostname))
+    ? new URLSearchParams(location.search).get("token") : null;
+  if (PROGRAM_TOKEN) $("linked").hidden = false;
+
+  async function sendToProgram() {
+    const base = last.name.replace(/\.png$/, "");
+    const q = "token=" + encodeURIComponent(PROGRAM_TOKEN);
+    const note = $("sentNote");
+    note.hidden = false; note.className = "note muted"; note.textContent = "Šaljem teren programu…";
+    $("sendRow").hidden = true;
+    try {
+      for (const [path, body] of [[`/upload/png?${q}&name=${encodeURIComponent(base)}`, last.png], [`/upload/json?${q}`, last.json]]) {
+        const r = await fetch(path, { method: "POST", body, headers: { "Content-Type": "application/octet-stream" } });
+        let msg = "HTTP " + r.status;
+        try { msg = (await r.json()).message || msg; } catch (e) { /* bez JSON odgovora */ }
+        if (!r.ok) throw new Error(msg);
+      }
+      note.className = "note sent";
+      note.innerHTML = "<b>✓ Teren je poslan programu.</b> Vratite se u konzolu – simulacija se nastavlja tamo. Ovu karticu možete zatvoriti.";
+    } catch (e) {
+      note.className = "note warn";
+      note.textContent = "Slanje nije uspjelo (" + e.message + "). Program možda više ne čeka podatke – zatvoren je ili je već primio teren. " +
+        "Preuzmite fajlove ispod ili u programu ponovo odaberite opciju 1.";
+      $("sendRow").hidden = false;
+    }
+  }
+  $("send").onclick = () => last && sendToProgram();
+
+  const map = L.map("map", { zoomControl: true }).setView([43.72, 18.27], 10);
+  // Napomena: tile.openstreetmap.org odbija zahtjeve bez Referera, a stranica otvorena kao lokalni fajl (file://)
+  // ga ne šalje – zato se koriste izvori koji rade i bez njega (provjereno: OpenTopoMap, Esri).
+  const topo = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom: 17, subdomains: "abc", attribution: "© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors, SRTM" });
+  const esriTopo = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", { maxZoom: 19, attribution: "Tiles © Esri — Esri, HERE, Garmin, USGS, NGA, EPA, USDA, NPS" });
+  const esriImg = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom: 19, attribution: "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community" });
+  const bases = [topo, esriTopo, esriImg];
+  topo.addTo(map);
+  L.control.layers({ "OpenTopoMap (reljef)": topo, "Esri topografska": esriTopo, "Esri satelitska": esriImg }).addTo(map);
+  // Ako aktivni sloj ne radi (npr. server privremeno nedostupan), automatski pređi na sljedeći – svaki se pokuša
+  // najviše jednom, da se bez interneta ne vrti u krug.
+  const failed = new Set();
+  bases.forEach((layer, k) => {
+    let errors = 0, loaded = 0;
+    layer.on("tileload", () => { ++loaded; });
+    layer.on("tileerror", () => {
+      if (++errors < 6 || loaded > 0 || failed.has(layer) || !map.hasLayer(layer)) return;
+      failed.add(layer);
+      const next = bases.find(b => !failed.has(b));
+      if (!next) { $("hint").textContent = "Nijedna podloga karte nije dostupna – provjerite internet vezu."; return; }
+      map.removeLayer(layer); next.addTo(map);
+      $("hint").textContent = "Podloga karte nije dostupna, prebačeno na drugu (izbor gore desno).";
+    });
+  });
+
+  function setBounds(b) {
+    bounds = b;
+    if (rect) map.removeLayer(rect);
+    rect = L.rectangle([[b.south, b.west], [b.north, b.east]], { color: "#1f6feb", weight: 2, fillOpacity: 0.12 }).addTo(map);
+    refreshPlan();
+  }
+
+  function row(k, v) { return `<tr><td>${k}</td><td>${v}</td></tr>`; }
+  function refreshPlan() {
+    const t = $("plan"), w = $("planWarn"); w.innerHTML = "";
+    $("make").disabled = true;
+    if (!bounds) { t.innerHTML = ""; return; }
+    try {
+      const pl = TerrainPicker.plan(bounds, +$("px").value);
+      t.innerHTML = row("Područje", `${fmt(pl.widthKm)} × ${fmt(pl.heightKm)} km`) + row("Slika", `${pl.width} × ${pl.height} px (${fmt(pl.cells / 1e6, 2)} M ćelija)`)
+        + row("Veličina ćelije", `${fmt(pl.cellSizeMeters, 2)} m`) + row("Pločica za preuzimanje", `${pl.tiles} (zum ${pl.zoom})`);
+      const notes = [];
+      if (pl.tiles > 400) notes.push("Previše pločica – smanjite područje ili dimenziju slike.");
+      else $("make").disabled = false;
+      if (pl.cellSizeMeters < 25) notes.push("Izvorni podaci imaju rezoluciju oko 30 m (u većini svijeta), pa ćelije manje od toga samo interpoliraju, a simulacija traje duže.");
+      if (pl.cells > 1.0e6) notes.push("Više od milion ćelija: simulacija može trajati satima. Za prvu probu uzmite 512 px.");
+      w.innerHTML = notes.map(n => `<div class="note warn">${n}</div>`).join("");
+    } catch (e) { t.innerHTML = `<tr><td colspan="2" class="err">${e.message}</td></tr>`; }
+  }
+
+  /* crtanje pravougaonika mišem */
+  $("draw").onclick = () => {
+    drawOn = !drawOn; $("draw").classList.toggle("active", drawOn);
+    $("hint").textContent = drawOn ? "Pritisnite lijevu tipku miša na karti i povucite do suprotnog ugla." : "";
+    map.getContainer().style.cursor = drawOn ? "crosshair" : "";
+  };
+  let start = null;
+  map.on("mousedown", e => {
+    if (!drawOn) return;
+    drawing = true; start = e.latlng; map.dragging.disable();
+  });
+  map.on("mousemove", e => {
+    if (!drawing) return;
+    const b = { south: Math.min(start.lat, e.latlng.lat), north: Math.max(start.lat, e.latlng.lat), west: Math.min(start.lng, e.latlng.lng), east: Math.max(start.lng, e.latlng.lng) };
+    if (rect) map.removeLayer(rect);
+    rect = L.rectangle([[b.south, b.west], [b.north, b.east]], { color: "#1f6feb", weight: 2, fillOpacity: 0.12 }).addTo(map);
+    bounds = b;
+  });
+  map.on("mouseup", () => {
+    if (!drawing) return;
+    drawing = false; map.dragging.enable(); drawOn = false; $("draw").classList.remove("active"); map.getContainer().style.cursor = "";
+    $("hint").textContent = "Područje je odabrano. Možete ga ponovo nacrtati ili nastaviti na „Generiši teren“.";
+    if (bounds) setBounds(bounds);
+  });
+  $("view").onclick = () => {
+    const b = map.getBounds(), dy = (b.getNorth() - b.getSouth()) * 0.1, dx = (b.getEast() - b.getWest()) * 0.1;
+    setBounds({ south: b.getSouth() + dy, north: b.getNorth() - dy, west: b.getWest() + dx, east: b.getEast() - dx });
+  };
+  $("clear").onclick = () => { if (rect) map.removeLayer(rect); rect = null; bounds = null; refreshPlan(); $("hint").textContent = ""; };
+  $("px").onchange = refreshPlan;
+
+  async function search() {
+    const q = $("q").value.trim(); if (!q) return;
+    $("hint").textContent = "Tražim…";
+    // Nominatim, a ako ne odgovori (npr. bez Referera s file://), Photon (komoot) kao rezerva.
+    try {
+      const r = await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + encodeURIComponent(q));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      if (!j.length) { $("hint").textContent = "Mjesto nije pronađeno."; return; }
+      const bb = j[0].boundingbox.map(Number);           // [south, north, west, east]
+      map.fitBounds([[bb[0], bb[2]], [bb[1], bb[3]]]);
+      $("hint").textContent = j[0].display_name;
+      return;
+    } catch (e) { /* pokušaj rezervnu pretragu */ }
+    try {
+      const r = await fetch("https://photon.komoot.io/api/?limit=1&q=" + encodeURIComponent(q));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const f = (await r.json()).features;
+      if (!f || !f.length) { $("hint").textContent = "Mjesto nije pronađeno."; return; }
+      const p = f[0].properties, ext = p.extent;          // [west, north, east, south] ako postoji
+      if (ext) map.fitBounds([[ext[3], ext[0]], [ext[1], ext[2]]]);
+      else map.setView([f[0].geometry.coordinates[1], f[0].geometry.coordinates[0]], 13);
+      $("hint").textContent = [p.name, p.state, p.country].filter(Boolean).join(", ");
+    } catch (e) { $("hint").textContent = "Pretraga nije uspjela: " + e.message; }
+  }
+  $("go").onclick = search; $("q").onkeydown = e => { if (e.key === "Enter") search(); };
+
+  /* generisanje, pregled i preuzimanje */
+  function preview(t) {
+    const c = $("preview"); c.hidden = false; c.width = t.width; c.height = t.height;
+    const g = c.getContext("2d"), img = g.createImageData(t.width, t.height);
+    const cs = t.cellSizeMeters, sunX = -0.6, sunY = -0.6;             // jednostavno sjenčenje reljefa (hillshade)
+    for (let y = 0; y < t.height; ++y) for (let x = 0; x < t.width; ++x) {
+      const i = y * t.width + x, e = t.elev;
+      const dx = (e[y * t.width + Math.min(x + 1, t.width - 1)] - e[y * t.width + Math.max(x - 1, 0)]) / (2 * cs);
+      const dy = (e[Math.min(y + 1, t.height - 1) * t.width + x] - e[Math.max(y - 1, 0) * t.width + x]) / (2 * cs);
+      const shade = Math.max(0, Math.min(1, 0.55 + 0.9 * (dx * sunX + dy * sunY) / Math.sqrt(1 + dx * dx + dy * dy)));
+      const h = (e[i] - t.min) / (t.max - t.min), v = Math.round(255 * (0.35 * h + 0.65 * shade));
+      img.data[4 * i] = v; img.data[4 * i + 1] = v; img.data[4 * i + 2] = v; img.data[4 * i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+  }
+  function download(name, blob) {
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+
+  $("make").onclick = async () => {
+    $("make").disabled = true; $("dl").hidden = true; $("next").hidden = true; $("preview").hidden = true; $("result").innerHTML = "";
+    $("sentNote").hidden = true; $("sendRow").hidden = true;
+    const prog = $("prog"); prog.hidden = false; prog.value = 0; $("status").className = "muted"; $("status").textContent = "Preuzimam visinske pločice…";
+    try {
+      const sea = $("sea").checked;
+      const t = await TerrainPicker.buildTerrain(bounds, +$("px").value, { clampSea: sea, onProgress: f => { prog.value = f; } });
+      $("status").textContent = "Pravim PNG…";
+      const png = await TerrainPicker.encodePng16(t.width, t.height, t.data16);
+      const meta = TerrainPicker.makeMetadata(t, { clampSea: sea });
+      const json = JSON.stringify(meta, null, 2);
+      last = { name: meta.heightmapFile, png: new Blob([png], { type: "image/png" }), json: new Blob([json], { type: "application/json" }), jsonName: meta.heightmapFile.replace(/\.png$/, ".terrain.json") };
+      preview(t);
+      $("result").innerHTML = row("Slika", `${t.width} × ${t.height} px`) + row("Veličina ćelije", `${fmt(t.cellSizeMeters, 3)} m`)
+        + row("Najniža tačka", `${fmt(t.min, 1)} m`) + row("Najviša tačka", `${fmt(t.max, 1)} m`) + row("Veličina PNG-a", `${fmt(png.length / 1024, 0)} KB`);
+      $("cmd").textContent = `prs_erosion --input ${meta.heightmapFile} --rain 100 --hours 3`;
+      $("dl").hidden = false;
+      if (PROGRAM_TOKEN) {
+        $("status").className = "ok"; $("status").textContent = "Gotovo.";
+        await sendToProgram();
+      } else {
+        $("status").className = "ok"; $("status").textContent = "Gotovo. Preuzmite oba fajla.";
+        $("next").hidden = false;
+      }
+    } catch (e) {
+      $("status").className = "err"; $("status").textContent = "Greška: " + e.message;
+    } finally { prog.hidden = true; refreshPlan(); }
+  };
+  $("dlPng").onclick = () => last && download(last.name, last.png);
+  $("dlJson").onclick = () => last && download(last.jsonName, last.json);
+  $("dlBoth").onclick = () => { if (!last) return; download(last.name, last.png); setTimeout(() => download(last.jsonName, last.json), 400); };
+
+  // za testiranje
+  window.__picker = { setBounds, map };
+})();
+</script>
+</body>
+</html>

@@ -8,8 +8,9 @@ __pycache__/
 .vs/
 out/
 
-# Generisani artefakti (nastaju iz koda i skripti, ne verzionisu se)
-*.docx
-results/figures/*.png
-results/sim512/*.npy
-results/.bench_done
+# Rezultati simulacija (prave se pri svakom pokretanju)
+output/*
+!output/README.md
+
+# tereni primljeni iz birača terena (tools/terrain_picker.html)
+tereni/

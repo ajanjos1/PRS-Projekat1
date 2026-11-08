@@ -24,14 +24,11 @@ Osnova implementacije je rad **Mei, Decaudin, Hu, 2007** (`mei2007fast`).
 | Ko | Kako |
 |---|---|
 | `docs/literature_review.md` | navodi „BibTeX: `references/bibliography.bib`" |
-| `README.md` (korijen) | odjeljci 13 i 15 |
-| `scripts/docgen/references.js` | komentar: „Svi podaci provjereni …, vidi `references/bibliography.bib`" – ali JavaScript ima **vlastitu** listu |
+| `README.md` (korijen) | odjeljak 15 |
+| `docs/ALGORITHM_EXPLANATION.md` | odjeljak 14 (literatura) |
 
 Nijedan program ne parsira `.bib` fajl; služi kao izvor istine za ljude i za eventualni LaTeX/BibTeX rad.
 
 ## Napomene
 
-- **Dvije liste literature:** `bibliography.bib` ima 21 zapis, a `scripts/docgen/references.js` 20, s drugačijim ključevima
-  (npr. `mei2007fast` naspram `mei2007`). Izostavljeni je `khrapov2020gpu` (u `docs/literature_review.md` označen kao
-  „nije citiran u dokumentu"). Pri dodavanju ili ispravci rada potrebno je izmijeniti oba mjesta.
 - Fajl je mali (≈ 8,9 KB, 102 linije) čist tekst, pa je pogodan za verzionisanje u gitu.

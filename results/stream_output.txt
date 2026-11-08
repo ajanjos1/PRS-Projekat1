@@ -1,4 +1,0 @@
-Triad p=1: 15.1614 GB/s (medijan), 16.65 GB/s (najbolje)
-Triad p=2: 34.9866 GB/s (medijan), 37.0522 GB/s (najbolje)
-Triad p=4: 37.0428 GB/s (medijan), 37.8217 GB/s (najbolje)
-Triad p=8: 37.7724 GB/s (medijan), 38.7772 GB/s (najbolje)

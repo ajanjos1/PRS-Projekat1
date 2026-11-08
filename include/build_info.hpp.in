@@ -1,7 +1,0 @@
-#pragma once
-// Generisano iz CMake-a (configure_file). Ne mijenjati ručno.
-#define PRS_BUILD_COMPILER "@PRS_BUILD_COMPILER@"
-#define PRS_BUILD_TYPE "@CMAKE_BUILD_TYPE@"
-#define PRS_BUILD_CXX_FLAGS "@PRS_BUILD_CXX_FLAGS@"
-#define PRS_BUILD_SCALAR_FLAGS "@PRS_BUILD_SCALAR_FLAGS@"
-#define PRS_BUILD_VECTOR_FLAGS "@PRS_BUILD_VECTOR_FLAGS@"

@@ -1,0 +1,22 @@
+{
+  "formatVersion": 1,
+  "heightmapFile": "teren_N43.707_E018.266_512x512.png",
+  "width": 512,
+  "height": 512,
+  "cellSizeMeters": 11.316229,
+  "minElevationMeters": 1002.973836,
+  "maxElevationMeters": 1901.255852,
+  "encoding": "16-bit grayscale PNG; 0 = minElevationMeters, 65535 = maxElevationMeters (linearno)",
+  "bbox": {
+    "south": 43.680952,
+    "west": 18.23,
+    "north": 43.733,
+    "east": 18.302
+  },
+  "source": "AWS Terrain Tiles (Mapzen), Terrarium, zoom 14",
+  "zoom": 14,
+  "tiles": 16,
+  "seaClamped": true,
+  "attribution": "SRTM data courtesy of the U.S. Geological Survey; Produced using Copernicus data and information funded by the European Union - EU-DEM layers; Mapzen/AWS Terrain Tiles",
+  "createdBy": "PRS terrain_picker.html"
+}

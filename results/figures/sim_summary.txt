@@ -1,7 +1,0 @@
-grid=512x512 steps=6000 dt=0.05 T=300.0s variant=G_omp_avx2 threads=2 wall=3.31833s
-terrain range initial: 5.83..51.95 m
-db: min=-15.902 max=7.297 p1=-7.856 p99=5.230 m
-eroded volume=220340.8 m3, deposited volume=172635.4 m3, suspended=47702.7 m3
-water: final volume=49793.3 m3, rain total=157286.4 m3, max depth=7.921 m, wet(d>1cm) fraction=0.505
-solid (b+s) relative drift: max |rel| = 4.255e-07
-speed (d>1cm): median=2.417 p99=19.259 m/s
