@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <filesystem>
 #include <numeric>
 #include <vector>
@@ -199,4 +202,59 @@ PRS_TEST("Scenario", test6_isto_ukupno_razlicito_trajanje)
     // Gornja granica: u ravnoteži izlaz ne može biti veći od intenziteta × površine
     const double area = 80 * 24 * 100.0;
     CHECK_LE(results[2].peakOutflow, 1.05 * 0.1 / 36000.0 * area);
+}
+
+// Test 11: mreža dovoljno velika da se OpenMP zaista uključi (prag je kMinCelijaZaParalelizaciju).
+// Ostali testovi rade na manjim mrežama, pa kroz njih prolazi samo jednonitna grana koda. Bez ovoga bi
+// greška u paralelnom dijelu (utrka ili pogrešna redukcija) prošla nezapaženo.
+PRS_TEST("Scenario", test11_velika_mreza_paralelno)
+{
+    const int N = 140; // 19 600 ćelija > 16 384 = prag za paljenje niti
+    Heightmap map = mountainTerrain(N, N, 70.0, 10.0);
+    SimulationConfig cfg;
+    cfg.rainfall.totalMillimeters = 60.0;
+    cfg.rainfall.durationHours = 0.2;
+
+    ErosionSimulation sim(map, cfg);
+    sim.run();
+    const SimulationState& s = sim.state();
+    const SimulationStatistics& st = sim.statistics();
+
+    CHECK(s.cellCount() >= kMinCelijaZaParalelizaciju); // ispod praga bi prolazila samo jednonitna grana
+    CHECK(st.allFinite);
+    CHECK(!st.aborted);
+    CHECK_LE(std::abs(st.waterBalanceRelativeError()), 1e-9);
+    CHECK_LE(std::abs(st.materialBalanceRelativeError()), 1e-9);
+    CHECK_LE(-st.minWaterDepth, 1e-9);
+    CHECK_LE(-st.minSediment, 1e-9);
+    CHECK(st.grossErodedVolume > 0.0); // erozija se zaista dogodila, scenarij nije prazan
+
+    note("mreza " + std::to_string(N) + "x" + std::to_string(N) + " = " + std::to_string(s.cellCount()) +
+         " celija, koraka " + std::to_string(st.steps) + ", erodirano " + fmt(st.grossErodedVolume, 2) + " m3");
+
+#ifdef _OPENMP
+    // Jedina provjera koja uporedjuje paralelnu granu sa serijskom, pa se broj niti postavlja izricito:
+    // sa OMP_NUM_THREADS=1 (ili na masini s jednim jezgrom) oba prolaza bi isla jednonitnom granom i
+    // poredjenje ne bi provjeravalo nista.
+    const int nitiPrije = omp_get_max_threads();
+    const int nitiZaTest = std::max(2, nitiPrije);
+
+    omp_set_num_threads(nitiZaTest);
+    ErosionSimulation simParalelno(map, cfg);
+    simParalelno.run();
+
+    omp_set_num_threads(1);
+    ErosionSimulation simSerijski(map, cfg);
+    simSerijski.run();
+    omp_set_num_threads(nitiPrije);
+
+    const SimulationState& sP = simParalelno.state();
+    const SimulationState& s1 = simSerijski.state();
+    double najvecaRazlika = 0.0;
+    for (std::size_t i = 0; i < sP.terrain.size(); ++i)
+        najvecaRazlika = std::max(najvecaRazlika, std::abs(sP.terrain[i] - s1.terrain[i]));
+    CHECK(najvecaRazlika == 0.0); // bit po bit isto, bez obzira na broj niti
+    note("niti " + std::to_string(nitiZaTest) + " naspram 1: najveca razlika visine " +
+         fmt(najvecaRazlika, 3) + " m");
+#endif
 }
