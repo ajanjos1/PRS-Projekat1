@@ -91,7 +91,7 @@ def ukupno():
 
 
 def sve():
-    po_fazama(); skaliranje(); ukupno(); traka_niti(); ijk_ikj(); instrumenti()
+    po_fazama(); skaliranje(); ukupno(); traka_niti(); ijk_ikj(); instrumenti(); iteracije()
     print(f'Grafovi: {OUT}')
 
 
@@ -233,6 +233,53 @@ def instrumenti():
                frameon=False, fontsize=8, ncol=2, loc='lower center', bbox_to_anchor=(0.5, -0.04))
     fig.tight_layout(rect=(0, 0.17, 1, 1))
     fig.savefig(f'{OUT}/instruments_zeleno_crveno.png', dpi=170); plt.close(fig)
+
+
+# ------------------------------------------- put kroz iteracije (serijska optimizacija faze protoka)
+# Svaka izmjena je mjerena posebno sa bench_faze (736x736, 1 nit); dvije ideje su mjerene pa odbacene.
+ITER_IMENA = ['polazno\nstanje', 'formula trenja\n(1 dijeljenje)', 'rub izdvojen\niz petlje',
+              'bez grananja\n+ omp simd']
+ITER_NS = [14.87, 14.01, 14.01, 12.36]
+ITER_NAPOMENA = ['', '-5,8 %', '0 %', '-11,8 %']
+ODBACENO = [('recipročni kubni korijen\nbez dijeljenja', '13,9 → 16,4 ns  (sporije)'),
+            ('obrada po blokovima\nzbog keša', 'vrijeme po ćeliji isto\nod 128² do 2048²')]
+
+
+def iteracije():
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(10.5, 4.4), gridspec_kw={'width_ratios': [2.15, 1]})
+
+    x = np.arange(len(ITER_NS))
+    boje = [SIVA] + [PLAVA] * 2 + [ZELENA]
+    b = ax.bar(x, ITER_NS, 0.62, color=boje)
+    for r, v, nap in zip(b, ITER_NS, ITER_NAPOMENA):
+        ax.text(r.get_x() + r.get_width() / 2, v + 0.22, f'{v:.2f}'.replace('.', ',') + ' ns',
+                ha='center', fontsize=9.5, fontweight='bold')
+        if nap:
+            ax.text(r.get_x() + r.get_width() / 2, v - 0.9, nap, ha='center', fontsize=8.5,
+                    color='white', fontweight='bold')
+    # stepenasta linija koja spaja vrhove, da se vidi putanja
+    for i in range(len(ITER_NS) - 1):
+        ax.plot([x[i], x[i] + 0.5, x[i] + 0.5, x[i + 1]],
+                [ITER_NS[i]] * 2 + [ITER_NS[i + 1]] * 2, color='#4A5568', lw=1.1, ls='--', zorder=0)
+    ax.set_xticks(x); ax.set_xticklabels(ITER_IMENA, fontsize=9)
+    ax.set_ylabel('faza protoka [ns po ćeliji po koraku]')
+    ax.set_ylim(0, max(ITER_NS) * 1.18)
+    ax.spines[['top', 'right']].set_visible(False); ax.grid(axis='y', alpha=.25)
+    ax.set_title('Serijska optimizacija korak po korak (736 × 736, jedna nit)', fontsize=11)
+
+    bx.axis('off')
+    bx.set_title('Izmjereno pa odbačeno', fontsize=11, color=CRVENA)
+    for k, (ime, mjera) in enumerate(ODBACENO):
+        y = 0.86 - k * 0.40
+        bx.add_patch(plt.Rectangle((0.02, y - 0.26), 0.96, 0.30, transform=bx.transAxes,
+                                   facecolor='#FFF5F5', edgecolor=CRVENA, lw=1.1))
+        bx.text(0.07, y - 0.03, ime, transform=bx.transAxes, fontsize=9.5, fontweight='bold',
+                va='center', color=CRVENA)
+        bx.text(0.07, y - 0.185, mjera, transform=bx.transAxes, fontsize=8.8, va='center', color='#2D3748')
+    bx.text(0.02, 0.03, 'Odluku je u oba slučaja donijelo mjerenje,\nne pretpostavka.',
+            transform=bx.transAxes, fontsize=8.8, style='italic', color='#4A5568', va='bottom')
+
+    fig.tight_layout(); fig.savefig(f'{OUT}/iteracije_serijski.png', dpi=170); plt.close(fig)
 
 
 if __name__ == '__main__':
