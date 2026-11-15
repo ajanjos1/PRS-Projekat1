@@ -91,7 +91,7 @@ def ukupno():
 
 
 def sve():
-    po_fazama(); skaliranje(); ukupno(); traka_niti(); ijk_ikj(); instrumenti(); iteracije()
+    po_fazama(); skaliranje(); ukupno(); traka_niti(); ijk_ikj(); instrumenti(); iteracije(); ubrzanje_velicina()
     print(f'Grafovi: {OUT}')
 
 
@@ -280,6 +280,33 @@ def iteracije():
             transform=bx.transAxes, fontsize=8.8, style='italic', color='#4A5568', va='bottom')
 
     fig.tight_layout(); fig.savefig(f'{OUT}/iteracije_serijski.png', dpi=170); plt.close(fig)
+
+
+# --------------------------------------------- ubrzanje u zavisnosti od velicine mreze (1 nit vs 6 niti)
+# bench_faze, 20 koraka, 3 ponavljanja. Mala mreza ne moze sakriti fiksni trosak po koraku.
+VEL_IMENA = ['128²', '256²', '512²', '736²\n(naš teren)', '1024²', '2048²']
+VEL_CELIJA = [16384, 65536, 262144, 541696, 1048576, 4194304]
+VEL_UBRZANJE = [1.64, 3.27, 4.01, 4.70, 5.04, 5.13]
+
+
+def ubrzanje_velicina():
+    fig, ax = plt.subplots(figsize=(8.6, 4.2))
+    x = np.arange(len(VEL_IMENA))
+    boje = [CRVENA if u < 3 else ('#D69E2E' if u < 4.5 else ZELENA) for u in VEL_UBRZANJE]
+    b = ax.bar(x, VEL_UBRZANJE, 0.6, color=boje)
+    for r, u, c in zip(b, VEL_UBRZANJE, VEL_CELIJA):
+        ax.text(r.get_x() + r.get_width() / 2, u + 0.1, f'{u:.2f}'.replace('.', ',') + '×',
+                ha='center', fontsize=9.5, fontweight='bold')
+        ax.text(r.get_x() + r.get_width() / 2, 0.18, f'{c:,}'.replace(',', ' ') + '\nćelija',
+                ha='center', fontsize=7.5, color='white')
+    ax.axhline(6, color='#4A5568', lw=1, ls=':')
+    ax.text(len(x) - 0.4, 6.1, 'šest brzih jezgara', fontsize=8, color='#4A5568', ha='right')
+    ax.set_xticks(x); ax.set_xticklabels(VEL_IMENA, fontsize=9)
+    ax.set_ylabel('ubrzanje: 1 nit → 6 niti')
+    ax.set_ylim(0, 6.6)
+    ax.spines[['top', 'right']].set_visible(False); ax.grid(axis='y', alpha=.25)
+    ax.set_title('Ubrzanje zavisi od veličine mreže (Apple M1 Pro, 6 niti)', fontsize=11)
+    fig.tight_layout(); fig.savefig(f'{OUT}/ubrzanje_po_velicini.png', dpi=170); plt.close(fig)
 
 
 if __name__ == '__main__':
