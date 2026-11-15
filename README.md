@@ -9,8 +9,14 @@ zatim unese ukupnu količinu kiše u L/m² i trajanje u satima, a program numeri
 transport i taloženje sedimenta i zapiše **erodiranu height mapu** – istih dimenzija i u istoj visinskoj skali, sa
 stvarno promijenjenim visinama terena.
 
-Ovo je **faza 2: serijska implementacija** (bez OpenMP-a, SIMD intrinsics, dretvi i GPU-a). Ranija implementacija
-(faza 1, CPU benchmark SIMD/OpenMP varijanti `prs_swe`) je zamijenjena ovom – vidi [odjeljak 13](#13-razlike-u-odnosu-na-fazu-1).
+Ovo je **faza 2** (bez GPU-a). Ranija implementacija (faza 1, CPU benchmark SIMD/OpenMP varijanti `prs_swe`) je
+zamijenjena ovom – vidi [odjeljak 13](#13-razlike-u-odnosu-na-fazu-1).
+
+> **Grana `paralelizacija`:** na faza-2 kod je dodana optimizacija i paralelizacija na procesoru (OpenMP i
+> `#pragma omp simd`), pa je simulacija oko 5,5× brža. Teren je **bit po bit identičan bez obzira na broj niti**;
+> u odnosu na fazu 2 postoji mala razlika u zaokruživanju, jer je formula trenja prepisana da ima jedno dijeljenje
+> umjesto dva (izmjereno: do 2,2·10⁻⁵ m na mreži 736 × 736, do 2,3·10⁻³ m na maloj i strmoj mreži). Po zahtjevu AC7
+> faza 2 je bila namjerno serijska; `-DPRS_ENABLE_OPENMP=OFF` vraća serijsko izvršavanje, ali ne i staru aritmetiku.
 
 Detaljno objašnjenje modela za odbranu: **[docs/ALGORITHM_EXPLANATION.md](docs/ALGORITHM_EXPLANATION.md)**.
 
@@ -361,12 +367,15 @@ python scripts/visualize_results.py output/planina --save output/planina/figure.
 | Build (Windows) | `cmake --build build-vs --config Release` → `build-vs\Release\prs_erosion.exe`, `prs_erosion_tests.exe` |
 | Konfiguracija + build (Linux/macOS) | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` |
 | Ciljevi | `prs_erosion_core` (biblioteka), `prs_erosion` (program), `prs_erosion_tests` (testovi) |
-| Opcije | `PRS_BUILD_TESTS` (ON) |
-| Zastavice | C++20; MSVC `/W4 /EHsc /utf-8 /permissive-`; GCC/Clang `-Wall -Wextra -Wpedantic`; Release optimizacija (`/O2`, `-O3`). **Bez** `/openmp`, `-fopenmp`, `/arch:AVX2`, `-mavx2` |
+| Opcije | `PRS_BUILD_TESTS` (ON), `PRS_ENABLE_OPENMP` (ON; OFF vraća čisto serijsko ponašanje faze 2) |
+| Zastavice | C++20; MSVC `/W4 /EHsc /utf-8 /permissive-`; GCC/Clang `-Wall -Wextra -Wpedantic`; Release optimizacija (`/O2`, `-O3`) |
+| OpenMP | GCC/Clang: `find_package(OpenMP)`; **MSVC: `/openmp:llvm`** (klasični `/openmp` je OpenMP 2.0 i ne podržava `reduction(max:)` ni `omp simd`) |
+| Runtime biblioteke | vezuju se **dinamički** (MSVC `/MD`), jer profileri tako prepoznaju paralelne regije; na Windowsu se potrebne DLL datoteke poslije prevođenja same kopiraju pored `.exe` fajla |
 
 **Šta je stvarno provjereno:**
 - Linux (Intel Xeon 2.1 GHz, 2 vCPU): čist build od nule sa **GCC 13.3 + CMake 3.28** bez ijednog upozorenja,
-  testovi **44/44 (306 provjera)**, program pokrenut na sva tri priložena primjera. Cijeli tok birač → lokalni
+  testovi **44/44 (306 provjera)** u verziji faze 2; na grani `paralelizacija` suita je **45 testova (315 provjera)**,
+  provjereno na macOS-u. Program pokrenut na sva tri priložena primjera. Cijeli tok birač → lokalni
   server → program → simulacija provjeren u headless Chromiumu sa simuliranim visinskim pločicama (poznata funkcija
   visine, greška 2 mm); preuzimanje stvarnih pločica provjereno u Chromeu (Bjelašnica: 1000–2058 m, 1,9 s).
 - Windows (Visual Studio 2026, MSBuild 18.11): projekat je izgrađen i pokrenut na računaru autora (meni, unos,
@@ -375,7 +384,8 @@ python scripts/visualize_results.py output/planina --save output/planina/figure.
 
 ## 10. Testovi
 
-`prs_erosion_tests` sadrži testove 1–10 iz specifikacije i dodatne provjere (44 testa, 306 provjera); svi
+`prs_erosion_tests` sadrži testove 1–10 iz specifikacije i dodatne provjere, a na grani `paralelizacija` i test 11
+(velika mreža, paralelni put koda) – ukupno 45 testova i 315 provjera; svi
 prolaze. Pokreće se iz korijena projekta (da nađe primjere u `assets/heightmaps`) ili preko CTest-a:
 
 ```bash
@@ -485,11 +495,12 @@ pravi erodiranu height mapu:
 | Izlaz | `.npy` snimci (float32) i CSV mjerenja | erodirana 16-bitna PNG height mapa u istoj skali + izvještaj |
 | Tok vode | Mei cijevi s konstantnim presjekom A = 1 m², bez trenja | presjek l·h_f, Manningovo trenje, CFL s faktorom 2 |
 | Erozija/transport | Mei bez Δt; konzervativni transport | relaksacija s Δt, kapacitet × dubina, nagib vodene površine; isti konzervativni transport |
-| Fokus i izvršavanje | brzina 11 varijanti (SIMD, AVX2, OpenMP), ~3 min demo | ispravnost modela, serijski, testovi 1–10 |
+| Fokus i izvršavanje | brzina 11 varijanti (SIMD, AVX2, OpenMP), ~3 min demo | ispravnost modela, testovi 1–11; faza 2 je bila serijska, a na grani `paralelizacija` je dodan OpenMP i `omp simd` (teren isti bez obzira na broj niti) |
 
 Iz faze 1 su zadržane provjerene ideje: struktura Mei modela (protoci → voda → erozija → transport), ograničenje
 odljeva K, konzervativni transport sedimenta kroz cijevi (`include/cell_ops.hpp`), dvostruko baferovanje i
-raspored podataka po poljima (SoA) – sve prepisano čitljivije, u `double` preciznosti i bez SIMD/OpenMP koda.
+raspored podataka po poljima (SoA) – sve prepisano čitljivije i u `double` preciznosti. Faza 2 je bila bez SIMD/OpenMP
+koda; na grani `paralelizacija` su oni vraćeni, ali samo kao `#pragma`, bez ijedne ručno pisane vektorske instrukcije.
 
 Kod faze 1 (`src/kernels_*`, `src/driver_*`, `src/simulation.cpp`, `src/terrain.cpp`, `include/cell_ops.hpp`, …),
 njeni testovi, benchmark skripte, rezultati mjerenja (`results/`) i generator ranijeg seminarskog dokumenta
