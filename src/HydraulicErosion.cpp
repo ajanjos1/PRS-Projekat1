@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 namespace prs
 {
@@ -45,6 +46,9 @@ namespace prs
         double eroded = 0.0;
         double deposited = 0.0;
 
+        // Svaka ćelija piše samo svoj bNext i sed; nagib se čita iz starog terena (double buffering).
+#pragma omp parallel for schedule(guided) if (s.cellCount() >= kMinCelijaZaParalelizaciju) \
+    reduction(+ : eroded, deposited)
         for (int y = 0; y < H; ++y)
         {
             for (int x = 0; x < W; ++x)
@@ -123,12 +127,21 @@ namespace prs
         // (a) Za svaku ćeliju: koliko sedimenta [m] nosi 1 m³/s izlaznog protoka u ovom koraku.
         //     Koncentracija s/d1 puta zapremina vode f·dt podijeljena površinom ćelije.
         const double dtOverArea = dt / area;
-        for (std::size_t i = 0; i < n; ++i)
-            perFlux[i] = (d1[i] > 0.0) ? sed[i] * dtOverArea / d1[i] : 0.0;
+        // Indeks je sa znakom (ptrdiff_t), jer MSVC u OpenMP petlji ne prihvata neoznaceni tip.
+        const std::ptrdiff_t nn = static_cast<std::ptrdiff_t>(n);
+#pragma omp parallel for schedule(guided) if (s.cellCount() >= kMinCelijaZaParalelizaciju)
+        for (std::ptrdiff_t i = 0; i < nn; ++i)
+            perFlux[static_cast<std::size_t>(i)] =
+                (d1[static_cast<std::size_t>(i)] > 0.0)
+                    ? sed[static_cast<std::size_t>(i)] * dtOverArea / d1[static_cast<std::size_t>(i)]
+                    : 0.0;
 
         // (b) Bilans: s_novo = s − (poslano kroz 4 cijevi) + (primljeno od 4 susjeda).
         TransportStepStats st;
         double boundaryOut = 0.0;
+        double negCorrection = 0.0; // lokalna zbog OpenMP redukcije
+#pragma omp parallel for schedule(guided) if (s.cellCount() >= kMinCelijaZaParalelizaciju) \
+    reduction(+ : boundaryOut, negCorrection)
         for (int y = 0; y < H; ++y)
         {
             for (int x = 0; x < W; ++x)
@@ -149,13 +162,14 @@ namespace prs
                 double sn = sed[i] - sent + received;
                 if (sn < 0.0)
                 {
-                    st.negativeCorrection += -sn * area;
+                    negCorrection += -sn * area;
                     sn = 0.0;
                 }
                 next[i] = sn;
             }
         }
         s.sediment.swap(s.sedimentNext);
+        st.negativeCorrection = negCorrection;
         st.boundaryOutflowVolume = boundaryOut * area;
         return st;
     }

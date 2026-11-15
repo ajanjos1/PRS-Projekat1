@@ -20,6 +20,10 @@
 
 namespace prs
 {
+    // Ispod ovoliko ćelija se posao ne dijeli na niti: paljenje i sinhronizacija niti tada košta više
+    // nego sam račun (izmjereno na testnim mrežama 40×30 i 96×96, gdje je OpenMP bio 2× sporiji).
+    inline constexpr std::size_t kMinCelijaZaParalelizaciju = 16384; // 128 × 128
+
     struct SimulationState
     {
         int width = 0;
