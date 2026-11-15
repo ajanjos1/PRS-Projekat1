@@ -14,3 +14,8 @@ output/*
 
 # tereni primljeni iz birača terena (tools/terrain_picker.html)
 tereni/
+# Generisani izlazi mjerenja (prave se skriptama iz bench/)
+bench/mreze/
+bench/rezultati/
+
+.DS_Store
